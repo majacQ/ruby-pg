@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+# -*- ruby -*-
 # vim: set noet nosta sw=4 ts=4 :
 #
 # Get the current WAL segment and offset from a master postgresql
@@ -15,21 +15,12 @@
 #	db_replication.monitor db-master.example.com ...
 #
 
-begin
-	require 'ostruct'
-	require 'optparse'
-	require 'pathname'
-	require 'etc'
-	require 'pg'
-	require 'pp'
-
-rescue LoadError # 1.8 support
-	unless Object.const_defined?( :Gem )
-		require 'rubygems'
-		retry
-	end
-	raise
-end
+require 'ostruct'
+require 'optparse'
+require 'pathname'
+require 'etc'
+require 'pg'
+require 'pp'
 
 
 ### A class to encapsulate the PG handles.
@@ -96,7 +87,7 @@ class PGMonitor
 	#########
 
 	### Ask the master for the current xlog information, to compare
-	### to slaves.  Returns true on succcess.  On failure, populates
+	### to slaves.  Returns true on success.  On failure, populates
 	### the failures array and returns false.
 	###
 	def get_current_wal

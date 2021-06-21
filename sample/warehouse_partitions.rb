@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+# -*- ruby -*-
 # vim: set nosta noet ts=4 sw=4:
 #
 # Script to automatically move partitioned tables and their indexes
@@ -36,21 +36,12 @@
 #
 
 
-begin
-	require 'date'
-	require 'ostruct'
-	require 'optparse'
-	require 'pathname'
-	require 'etc'
-	require 'pg'
-
-rescue LoadError # 1.8 support
-	unless Object.const_defined?( :Gem )
-		require 'rubygems'
-		retry
-	end
-	raise
-end
+require 'date'
+require 'ostruct'
+require 'optparse'
+require 'pathname'
+require 'etc'
+require 'pg'
 
 
 ### A tablespace migration class.
@@ -150,7 +141,7 @@ class PGWarehouse
 		#
 		self.db.exec( query ) do |res|
 			res.each do |row|
-				relations[ row['oid'] ] = { 
+				relations[ row['oid'] ] = {
 					:name       => row['name'],
 					:tablespace => row['tspace'],
 					:indexes    => [],
@@ -159,7 +150,7 @@ class PGWarehouse
 			end
 		end
 
-		# Add table inheritence information.
+		# Add table inheritance information.
 		#
 		db.exec 'SELECT inhrelid AS oid, inhparent AS parent FROM pg_inherits' do |res|
 			res.each do |row|

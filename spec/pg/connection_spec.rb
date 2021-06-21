@@ -1,44 +1,13 @@
-#!/usr/bin/env rspec
+# -*- rspec -*-
 #encoding: utf-8
 
-BEGIN {
-	require 'pathname'
+require_relative '../helpers'
 
-	basedir = Pathname( __FILE__ ).dirname.parent.parent
-	libdir = basedir + 'lib'
-
-	$LOAD_PATH.unshift( basedir.to_s ) unless $LOAD_PATH.include?( basedir.to_s )
-	$LOAD_PATH.unshift( libdir.to_s ) unless $LOAD_PATH.include?( libdir.to_s )
-}
-
-require 'rspec'
-require 'spec/lib/helpers'
 require 'timeout'
 require 'socket'
 require 'pg'
 
 describe PG::Connection do
-
-	before( :all ) do
-		@conn = setup_testing_db( "PG_Connection" )
-	end
-
-	before( :each ) do
-		@conn.exec( 'BEGIN' ) unless example.metadata[:without_transaction]
-	end
-
-	after( :each ) do
-		@conn.exec( 'ROLLBACK' ) unless example.metadata[:without_transaction]
-	end
-
-	after( :all ) do
-		teardown_testing_db( @conn )
-	end
-
-
-	#
-	# Examples
-	#
 
 	it "can create a connection option string from a Hash of options" do
 		optstring = described_class.parse_connect_args(
@@ -47,54 +16,130 @@ describe PG::Connection do
 			'sslmode' => 'require'
 		  )
 
-		optstring.should be_a( String )
-		optstring.should =~ /(^|\s)host='pgsql.example.com'/
-		optstring.should =~ /(^|\s)dbname='db01'/
-		optstring.should =~ /(^|\s)sslmode='require'/
+		expect( optstring ).to be_a( String )
+		expect( optstring ).to match( /(^|\s)host='pgsql.example.com'/ )
+		expect( optstring ).to match( /(^|\s)dbname='db01'/ )
+		expect( optstring ).to match( /(^|\s)sslmode='require'/ )
 	end
 
 	it "can create a connection option string from positional parameters" do
 		optstring = described_class.parse_connect_args( 'pgsql.example.com', nil, '-c geqo=off', nil,
 		                                       'sales' )
 
-		optstring.should be_a( String )
-		optstring.should =~ /(^|\s)host='pgsql.example.com'/
-		optstring.should =~ /(^|\s)dbname='sales'/
-		optstring.should =~ /(^|\s)options='-c geqo=off'/
+		expect( optstring ).to be_a( String )
+		expect( optstring ).to match( /(^|\s)host='pgsql.example.com'/ )
+		expect( optstring ).to match( /(^|\s)dbname='sales'/ )
+		expect( optstring ).to match( /(^|\s)options='-c geqo=off'/ )
 
-		optstring.should_not =~ /port=/
-		optstring.should_not =~ /tty=/
+		expect( optstring ).to_not match( /port=/ )
+		expect( optstring ).to_not match( /tty=/ )
 	end
 
 	it "can create a connection option string from a mix of positional and hash parameters" do
 		optstring = described_class.parse_connect_args( 'pgsql.example.com',
 		                                       :dbname => 'licensing', :user => 'jrandom' )
 
-		optstring.should be_a( String )
-		optstring.should =~ /(^|\s)host='pgsql.example.com'/
-		optstring.should =~ /(^|\s)dbname='licensing'/
-		optstring.should =~ /(^|\s)user='jrandom'/
+		expect( optstring ).to be_a( String )
+		expect( optstring ).to match( /(^|\s)host='pgsql.example.com'/ )
+		expect( optstring ).to match( /(^|\s)dbname='licensing'/ )
+		expect( optstring ).to match( /(^|\s)user='jrandom'/ )
+	end
+
+	it "can create a connection option string from an option string and a hash" do
+		optstring = described_class.parse_connect_args( 'dbname=original', :user => 'jrandom' )
+
+		expect( optstring ).to be_a( String )
+		expect( optstring ).to match( /(^|\s)dbname=original/ )
+		expect( optstring ).to match( /(^|\s)user='jrandom'/ )
 	end
 
 	it "escapes single quotes and backslashes in connection parameters" do
-		described_class.parse_connect_args( "DB 'browser' \\" ).
-			should =~ /host='DB \\'browser\\' \\\\'/
+		expect(
+			described_class.parse_connect_args( "DB 'browser' \\" )
+		).to match( /host='DB \\'browser\\' \\\\'/ )
 
+	end
+
+	let(:uri) { 'postgresql://user:pass@pgsql.example.com:222/db01?sslmode=require' }
+
+	it "can connect using a URI" do
+		string = described_class.parse_connect_args( uri )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql://user:pass@pgsql.example.com:222/db01\?} )
+		expect( string ).to match( %r{\?.*sslmode=require} )
+
+		string = described_class.parse_connect_args( URI.parse(uri) )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql://user:pass@pgsql.example.com:222/db01\?} )
+		expect( string ).to match( %r{\?.*sslmode=require} )
+	end
+
+	it "can create a connection URI from a URI and a hash" do
+		string = described_class.parse_connect_args( uri, :connect_timeout => 2 )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql://user:pass@pgsql.example.com:222/db01\?} )
+		expect( string ).to match( %r{\?.*sslmode=require} )
+		expect( string ).to match( %r{\?.*connect_timeout=2} )
+
+		string = described_class.parse_connect_args( uri,
+			:user => 'a',
+			:password => 'b',
+			:host => 'localhost',
+			:port => 555,
+			:dbname => 'x' )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql://\?} )
+		expect( string ).to match( %r{\?.*user=a} )
+		expect( string ).to match( %r{\?.*password=b} )
+		expect( string ).to match( %r{\?.*host=localhost} )
+		expect( string ).to match( %r{\?.*port=555} )
+		expect( string ).to match( %r{\?.*dbname=x} )
+	end
+
+	it "can create a connection URI with a non-standard domain socket directory" do
+		string = described_class.parse_connect_args( 'postgresql://%2Fvar%2Flib%2Fpostgresql/dbname' )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql://%2Fvar%2Flib%2Fpostgresql/dbname} )
+
+		string = described_class.
+			parse_connect_args( 'postgresql:///dbname', :host => '/var/lib/postgresql' )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{^postgresql:///dbname\?} )
+		expect( string ).to match( %r{\?.*host=%2Fvar%2Flib%2Fpostgresql} )
 	end
 
 	it "connects with defaults if no connection parameters are given" do
-		described_class.parse_connect_args.should == ''
+		expect( described_class.parse_connect_args ).to eq( '' )
 	end
 
 	it "connects successfully with connection string" do
-		tmpconn = described_class.connect(@conninfo)
-		tmpconn.status.should == PG::CONNECTION_OK
+		conninfo_with_colon_in_password = "host=localhost user=a port=555 dbname=test password=a:a"
+
+		string = described_class.parse_connect_args( conninfo_with_colon_in_password )
+
+		expect( string ).to be_a( String )
+		expect( string ).to match( %r{(^|\s)user=a} )
+		expect( string ).to match( %r{(^|\s)password=a:a} )
+		expect( string ).to match( %r{(^|\s)host=localhost} )
+		expect( string ).to match( %r{(^|\s)port=555} )
+		expect( string ).to match( %r{(^|\s)dbname=test} )
+	end
+
+	it "connects successfully with connection string" do
+		tmpconn = described_class.connect( @conninfo )
+		expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		tmpconn.finish
 	end
 
 	it "connects using 7 arguments converted to strings" do
-		tmpconn = described_class.connect('localhost', @port, nil, nil, :test, nil, nil)
-		tmpconn.status.should == PG::CONNECTION_OK
+		tmpconn = described_class.connect( 'localhost', @port, nil, nil, :test, nil, nil )
+		expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		tmpconn.finish
 	end
 
@@ -103,87 +148,157 @@ describe PG::Connection do
 			:host => 'localhost',
 			:port => @port,
 			:dbname => :test)
-		tmpconn.status.should == PG::CONNECTION_OK
+		expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		tmpconn.finish
 	end
 
-	it "connects using a hash of optional connection parameters", :postgresql_90 do
+	it "connects using a hash of optional connection parameters" do
 		tmpconn = described_class.connect(
 			:host => 'localhost',
 			:port => @port,
 			:dbname => :test,
 			:keepalives => 1)
-		tmpconn.status.should == PG::CONNECTION_OK
+		expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		tmpconn.finish
 	end
 
 	it "raises an exception when connecting with an invalid number of arguments" do
 		expect {
-			described_class.connect( 1, 2, 3, 4, 5, 6, 7, 'extra' )
-		}.to raise_error( ArgumentError, /extra positional parameter/i )
+			described_class.connect( 1, 2, 3, 4, 5, 6, 7, 'the-extra-arg' )
+		}.to raise_error do |error|
+			expect( error ).to be_an( ArgumentError )
+			expect( error.message ).to match( /extra positional parameter/i )
+			expect( error.message ).to match( /8/ )
+			expect( error.message ).to match( /the-extra-arg/ )
+		end
 	end
 
-	it "can connect asynchronously", :unix do
+	it "can connect asynchronously" do
 		tmpconn = described_class.connect_start( @conninfo )
-		tmpconn.should be_a( described_class )
-		socket = tmpconn.socket_io
-		status = tmpconn.connect_poll
+		expect( tmpconn ).to be_a( described_class )
 
-		while status != PG::PGRES_POLLING_OK
-			if status == PG::PGRES_POLLING_READING
-				select( [socket], [], [], 5.0 ) or
-					raise "Asynchronous connection timed out!"
-
-			elsif status == PG::PGRES_POLLING_WRITING
-				select( [], [socket], [], 5.0 ) or
-					raise "Asynchronous connection timed out!"
-			end
-			status = tmpconn.connect_poll
-		end
-
-		tmpconn.status.should == PG::CONNECTION_OK
+		wait_for_polling_ok(tmpconn)
+		expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		tmpconn.finish
 	end
 
-	it "can connect asynchronously for the duration of a block", :unix do
+	it "can connect asynchronously for the duration of a block" do
 		conn = nil
 
 		described_class.connect_start(@conninfo) do |tmpconn|
-			tmpconn.should be_a( described_class )
+			expect( tmpconn ).to be_a( described_class )
 			conn = tmpconn
-			socket = tmpconn.socket_io
-			status = tmpconn.connect_poll
 
-			while status != PG::PGRES_POLLING_OK
-				if status == PG::PGRES_POLLING_READING
-					if(not select([socket],[],[],5.0))
-						raise "Asynchronous connection timed out!"
-					end
-				elsif(status == PG::PGRES_POLLING_WRITING)
-					if(not select([],[socket],[],5.0))
-						raise "Asynchronous connection timed out!"
-					end
-				end
-				status = tmpconn.connect_poll
-			end
-
-			tmpconn.status.should == PG::CONNECTION_OK
+			wait_for_polling_ok(tmpconn)
+			expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
 		end
 
-		conn.should be_finished()
+		expect( conn ).to be_finished()
+	end
+
+	context "with async established connection" do
+		before :each do
+			@conn2 = described_class.connect_start( @conninfo )
+			wait_for_polling_ok(@conn2)
+			expect( @conn2 ).to still_be_usable
+		end
+
+		after :each do
+			expect( @conn2 ).to still_be_usable
+			@conn2.close
+		end
+
+		it "conn.send_query and IO.select work" do
+			@conn2.send_query("SELECT 1")
+			res = wait_for_query_result(@conn2)
+			expect( res.values ).to eq([["1"]])
+		end
+
+		it "conn.send_query and conn.block work" do
+			@conn2.send_query("SELECT 2")
+			@conn2.block
+			res = @conn2.get_last_result
+			expect( res.values ).to eq([["2"]])
+		end
+
+		it "conn.async_query works" do
+			res = @conn2.async_query("SELECT 3")
+			expect( res.values ).to eq([["3"]])
+			expect( @conn2 ).to still_be_usable
+
+			res = @conn2.query("SELECT 4")
+		end
+
+		it "can use conn.reset_start to restart the connection" do
+			ios = IO.pipe
+			conn = described_class.connect_start( @conninfo )
+			wait_for_polling_ok(conn)
+
+			# Close the two pipe file descriptors, so that the file descriptor of
+			# newly established connection is probably distinct from the previous one.
+			ios.each(&:close)
+			conn.reset_start
+			wait_for_polling_ok(conn, :reset_poll)
+
+			# The new connection should work even when the file descriptor has changed.
+			conn.send_query("SELECT 1")
+			res = wait_for_query_result(conn)
+			expect( res.values ).to eq([["1"]])
+
+			conn.close
+		end
+
+		it "should properly close a socket IO when GC'ed" do
+			# This results in
+			#    Errno::ENOTSOCK: An operation was attempted on something that is not a socket.
+			# on Windows when rb_w32_unwrap_io_handle() isn't called in pgconn_gc_free().
+			5.times do
+				conn = described_class.connect( @conninfo )
+				conn.socket_io.close
+			end
+			GC.start
+			IO.pipe.each(&:close)
+		end
+	end
+
+	it "raises proper error when sending fails" do
+		conn = described_class.connect_start( '127.0.0.1', 54320, "", "", "me", "xxxx", "somedb" )
+		expect{ conn.exec 'SELECT 1' }.to raise_error(PG::UnableToSend, /no connection/)
 	end
 
 	it "doesn't leave stale server connections after finish" do
 		described_class.connect(@conninfo).finish
 		sleep 0.5
 		res = @conn.exec(%[SELECT COUNT(*) AS n FROM pg_stat_activity
-							WHERE usename IS NOT NULL])
+							WHERE usename IS NOT NULL AND application_name != ''])
 		# there's still the global @conn, but should be no more
-		res[0]['n'].should == '1'
+		expect( res[0]['n'] ).to eq( '1' )
 	end
 
+	it "can retrieve it's connection parameters for the established connection" do
+		expect( @conn.db ).to eq( "test" )
+		expect( @conn.user ).to be_a_kind_of( String )
+		expect( @conn.pass ).to eq( "" )
+		expect( @conn.host ).to eq( "localhost" )
+		expect( @conn.port ).to eq( @port )
+		expect( @conn.tty ).to eq( "" )
+		expect( @conn.options ).to eq( "" )
+	end
 
-	EXPECTED_TRACE_OUTPUT = %{
+	it "can set error verbosity" do
+		old = @conn.set_error_verbosity( PG::PQERRORS_TERSE )
+		new = @conn.set_error_verbosity( old )
+		expect( new ).to eq( PG::PQERRORS_TERSE )
+	end
+
+	it "can set error context visibility", :postgresql_96 do
+		old = @conn.set_error_context_visibility( PG::PQSHOW_CONTEXT_NEVER )
+		new = @conn.set_error_context_visibility( old )
+		expect( new ).to eq( PG::PQSHOW_CONTEXT_NEVER )
+	end
+
+	let(:expected_trace_output) do
+		%{
 		To backend> Msg Q
 		To backend> "SELECT 1 AS one"
 		To backend> Msg complete, length 21
@@ -211,9 +326,9 @@ describe PG::Connection do
 		From backend (#4)> 5
 		From backend> T
 		}.gsub( /^\t{2}/, '' ).lstrip
+	end
 
-	unless RUBY_PLATFORM =~ /mswin|mingw/
-		it "trace and untrace client-server communication" do
+	it "trace and untrace client-server communication", :unix do
 			# be careful to explicitly close files so that the
 			# directory can be removed and we don't have to wait for
 			# the GC to run.
@@ -222,27 +337,23 @@ describe PG::Connection do
 			@conn.trace( trace_io )
 			trace_io.close
 
-			res = @conn.exec("SELECT 1 AS one")
+			@conn.exec("SELECT 1 AS one")
 			@conn.untrace
 
-			res = @conn.exec("SELECT 2 AS two")
+			@conn.exec("SELECT 2 AS two")
 
 			trace_data = trace_file.read
 
-			expected_trace_output = EXPECTED_TRACE_OUTPUT.dup
-			# For PostgreSQL < 9.0, the output will be different:
-			# -From backend (#4)> 13
-			# -From backend> "SELECT 1"
-			# +From backend (#4)> 11
-			# +From backend> "SELECT"
-			if @conn.server_version < 90000
-				expected_trace_output.sub!( /From backend \(#4\)> 13/, 'From backend (#4)> 11' )
-				expected_trace_output.sub!( /From backend> "SELECT 1"/, 'From backend> "SELECT"' )
-			end
+			# For async_exec the output will be different:
+			#  From backend> Z
+			#  From backend (#4)> 5
+			# +From backend> Z
+			# +From backend (#4)> 5
+			#  From backend> T
+			trace_data.sub!( /(From backend> Z\nFrom backend \(#4\)> 5\n){3}/m, '\\1\\1' )
 
-			trace_data.should == expected_trace_output
+			expect( trace_data ).to eq( expected_trace_output )
 		end
-	end
 
 	it "allows a query to be cancelled" do
 		error = false
@@ -252,10 +363,37 @@ describe PG::Connection do
 		if(tmpres.result_status != PG::PGRES_TUPLES_OK)
 			error = true
 		end
-		error.should == true
+		expect( error ).to eq( true )
 	end
 
-	it "automatically rolls back a transaction started with described_class#transaction if an exception " +
+	it "can stop a thread that runs a blocking query with async_exec" do
+		start = Time.now
+		t = Thread.new do
+			@conn.async_exec( 'select pg_sleep(10)' )
+		end
+		sleep 0.1
+
+		t.kill
+		t.join
+		expect( (Time.now - start) ).to be < 10
+	end
+
+	it "should work together with signal handlers", :unix do
+		signal_received = false
+		trap 'USR2' do
+			signal_received = true
+		end
+
+		Thread.new do
+			sleep 0.1
+			Process.kill("USR2", Process.pid)
+		end
+		@conn.exec("select pg_sleep(0.3)")
+		expect( signal_received ).to be_truthy
+	end
+
+
+	it "automatically rolls back a transaction started with Connection#transaction if an exception " +
 	   "is raised" do
 		# abort the per-example transaction so we can test our own
 		@conn.exec( 'ROLLBACK' )
@@ -263,15 +401,29 @@ describe PG::Connection do
 		res = nil
 		@conn.exec( "CREATE TABLE pie ( flavor TEXT )" )
 
-		expect {
-			res = @conn.transaction do
-				@conn.exec( "INSERT INTO pie VALUES ('rhubarb'), ('cherry'), ('schizophrenia')" )
-				raise "Oh noes! All pie is gone!"
-			end
-		}.to raise_exception( RuntimeError, /all pie is gone/i )
+		begin
+			expect {
+				res = @conn.transaction do
+					@conn.exec( "INSERT INTO pie VALUES ('rhubarb'), ('cherry'), ('schizophrenia')" )
+					raise "Oh noes! All pie is gone!"
+				end
+			}.to raise_exception( RuntimeError, /all pie is gone/i )
 
-		res = @conn.exec( "SELECT * FROM pie" )
-		res.ntuples.should == 0
+			res = @conn.exec( "SELECT * FROM pie" )
+			expect( res.ntuples ).to eq( 0 )
+		ensure
+			@conn.exec( "DROP TABLE pie" )
+		end
+	end
+
+	it "returns the block result from Connection#transaction" do
+		# abort the per-example transaction so we can test our own
+		@conn.exec( 'ROLLBACK' )
+
+		res = @conn.transaction do
+			"transaction result"
+		end
+		expect( res ).to eq( "transaction result" )
 	end
 
 	it "not read past the end of a large object" do
@@ -279,12 +431,45 @@ describe PG::Connection do
 			oid = @conn.lo_create( 0 )
 			fd = @conn.lo_open( oid, PG::INV_READ|PG::INV_WRITE )
 			@conn.lo_write( fd, "foobar" )
-			@conn.lo_read( fd, 10 ).should be_nil()
+			expect( @conn.lo_read( fd, 10 ) ).to be_nil()
 			@conn.lo_lseek( fd, 0, PG::SEEK_SET )
-			@conn.lo_read( fd, 10 ).should == 'foobar'
+			expect( @conn.lo_read( fd, 10 ) ).to eq( 'foobar' )
 		end
 	end
 
+	it "supports explicitly calling #exec_params" do
+		@conn.exec( "CREATE TABLE students ( name TEXT, age INTEGER )" )
+		@conn.exec_params( "INSERT INTO students VALUES( $1, $2 )", ['Wally', 8] )
+		@conn.exec_params( "INSERT INTO students VALUES( $1, $2 )", ['Sally', 6] )
+		@conn.exec_params( "INSERT INTO students VALUES( $1, $2 )", ['Dorothy', 4] )
+
+		res = @conn.exec_params( "SELECT name FROM students WHERE age >= $1", [6] )
+		expect( res.values ).to eq( [ ['Wally'], ['Sally'] ] )
+	end
+
+	it "supports hash form parameters for #exec_params" do
+		hash_param_bin = { value: ["00ff"].pack("H*"), type: 17, format: 1 }
+		hash_param_nil = { value: nil, type: 17, format: 1 }
+		res = @conn.exec_params( "SELECT $1, $2",
+					[ hash_param_bin, hash_param_nil ] )
+		expect( res.values ).to eq( [["\\x00ff", nil]] )
+		expect( result_typenames(res) ).to eq( ['bytea', 'bytea'] )
+	end
+
+	it "should work with arbitrary number of params" do
+		begin
+			3.step( 12, 0.2 ) do |exp|
+				num_params = (2 ** exp).to_i
+				sql = num_params.times.map{|n| "$#{n+1}::INT" }.join(",")
+				params = num_params.times.to_a
+				res = @conn.exec_params( "SELECT #{sql}", params )
+				expect( res.nfields ).to eq( num_params )
+				expect( res.values ).to eq( [num_params.times.map(&:to_s)] )
+			end
+		rescue PG::ProgramLimitExceeded
+			# Stop silently if the server complains about too many params
+		end
+	end
 
 	it "can wait for NOTIFY events" do
 		@conn.exec( 'ROLLBACK' )
@@ -300,7 +485,7 @@ describe PG::Connection do
 			end
 		end
 
-		@conn.wait_for_notify( 10 ).should == 'woo'
+		expect( @conn.wait_for_notify( 10 ) ).to eq( 'woo' )
 		@conn.exec( 'UNLISTEN woo' )
 
 		t.join
@@ -322,8 +507,8 @@ describe PG::Connection do
 
 		eventpid = event = nil
 		@conn.wait_for_notify( 10 ) {|*args| event, eventpid = args }
-		event.should == 'woo'
-		eventpid.should be_an( Integer )
+		expect( event ).to eq( 'woo' )
+		expect( eventpid ).to be_an( Integer )
 
 		@conn.exec( 'UNLISTEN woo' )
 
@@ -350,8 +535,8 @@ describe PG::Connection do
 			channels << @conn.wait_for_notify( 2 )
 		end
 
-		channels.should have( 3 ).members
-		channels.should include( 'woo', 'war', 'woz' )
+		expect( channels.size ).to eq( 3 )
+		expect( channels ).to include( 'woo', 'war', 'woz' )
 
 		@conn.exec( 'UNLISTEN woz' )
 		@conn.exec( 'UNLISTEN war' )
@@ -373,25 +558,185 @@ describe PG::Connection do
 		# Cause the notification to buffer, but not be read yet
 		@conn.exec( 'SELECT 1' )
 
-		@conn.wait_for_notify( 10 ).should == 'woo'
+		expect( @conn.wait_for_notify( 10 ) ).to eq( 'woo' )
 		@conn.exec( 'UNLISTEN woo' )
+	end
+
+	it "can receive notices while waiting for NOTIFY without exceeding the timeout" do
+		retries = 20
+		loop do
+			@conn.get_last_result  # clear pending results
+			expect( retries-=1 ).to be > 0
+
+			notices = []
+			lt = nil
+			@conn.set_notice_processor do |msg|
+				notices << [msg, Time.now - lt] if lt
+				lt = Time.now
+			end
+
+			st = Time.now
+			# Send two notifications while a query is running
+			@conn.send_query <<-EOT
+				DO $$ BEGIN
+					RAISE NOTICE 'notice1';
+					PERFORM pg_sleep(0.3);
+					RAISE NOTICE 'notice2';
+				END; $$ LANGUAGE plpgsql
+			EOT
+
+			# wait_for_notify recalculates the internal select() timeout after each all to set_notice_processor
+			expect( @conn.wait_for_notify( 0.5 ) ).to be_nil
+			et = Time.now
+
+			# The notifications should have been delivered while (not after) the query is running.
+			# Check this and retry otherwise.
+			next unless notices.size == 1         # should have received one notice
+			expect( notices.first[0] ).to match(/notice2/)
+			next unless notices.first[1] >= 0.29  # should take at least the pg_sleep() duration
+			next unless notices.first[1] < 0.49   # but should be shorter than the wait_for_notify() duration
+			next unless et - st < 0.75            # total time should not exceed wait_for_notify() + pg_sleep() duration
+			expect( et - st ).to be >= 0.49       # total time must be at least the wait_for_notify() duration
+			break
+		end
 	end
 
 	it "yields the result if block is given to exec" do
 		rval = @conn.exec( "select 1234::int as a union select 5678::int as a" ) do |result|
 			values = []
-			result.should be_kind_of( PG::Result )
-			result.ntuples.should == 2
+			expect( result ).to be_kind_of( PG::Result )
+			expect( result.ntuples ).to eq( 2 )
 			result.each do |tuple|
 				values << tuple['a']
 			end
 			values
 		end
 
-		rval.should have( 2 ).members
-		rval.should include( '5678', '1234' )
+		expect( rval.size ).to eq( 2 )
+		expect( rval ).to include( '5678', '1234' )
 	end
 
+	it "can process #copy_data output queries" do
+		rows = []
+		res2 = @conn.copy_data( "COPY (SELECT 1 UNION ALL SELECT 2) TO STDOUT" ) do |res|
+			expect( res.result_status ).to eq( PG::PGRES_COPY_OUT )
+			expect( res.nfields ).to eq( 1 )
+			while row=@conn.get_copy_data
+				rows << row
+			end
+		end
+		expect( rows ).to eq( ["1\n", "2\n"] )
+		expect( res2.result_status ).to eq( PG::PGRES_COMMAND_OK )
+		expect( @conn ).to still_be_usable
+	end
+
+	it "can handle incomplete #copy_data output queries" do
+		expect {
+			@conn.copy_data( "COPY (SELECT 1 UNION ALL SELECT 2) TO STDOUT" ) do |res|
+				@conn.get_copy_data
+			end
+		}.to raise_error(PG::NotAllCopyDataRetrieved, /Not all/)
+		expect( @conn ).to still_be_usable
+	end
+
+	it "can handle client errors in #copy_data for output" do
+		expect {
+			@conn.copy_data( "COPY (SELECT 1 UNION ALL SELECT 2) TO STDOUT" ) do
+				raise "boom"
+			end
+		}.to raise_error(RuntimeError, "boom")
+		expect( @conn ).to still_be_usable
+	end
+
+	it "can handle server errors in #copy_data for output" do
+		@conn.exec "ROLLBACK"
+		@conn.transaction do
+			@conn.exec( "CREATE FUNCTION errfunc() RETURNS int AS $$ BEGIN RAISE 'test-error'; END; $$ LANGUAGE plpgsql;" )
+			expect {
+				@conn.copy_data( "COPY (SELECT errfunc()) TO STDOUT" ) do |res|
+					while @conn.get_copy_data
+					end
+				end
+			}.to raise_error(PG::Error, /test-error/)
+		end
+		expect( @conn ).to still_be_usable
+	end
+
+	it "can process #copy_data input queries" do
+		@conn.exec( "CREATE TEMP TABLE copytable (col1 TEXT)" )
+		res2 = @conn.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+			expect( res.result_status ).to eq( PG::PGRES_COPY_IN )
+			expect( res.nfields ).to eq( 1 )
+			@conn.put_copy_data "1\n"
+			@conn.put_copy_data "2\n"
+		end
+		expect( res2.result_status ).to eq( PG::PGRES_COMMAND_OK )
+
+		expect( @conn ).to still_be_usable
+
+		res = @conn.exec( "SELECT * FROM copytable ORDER BY col1" )
+		expect( res.values ).to eq( [["1"], ["2"]] )
+	end
+
+	it "can handle client errors in #copy_data for input" do
+		@conn.exec "ROLLBACK"
+		@conn.transaction do
+			@conn.exec( "CREATE TEMP TABLE copytable (col1 TEXT)" )
+			expect {
+				@conn.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+					raise "boom"
+				end
+			}.to raise_error(RuntimeError, "boom")
+		end
+
+		expect( @conn ).to still_be_usable
+	end
+
+	it "can handle server errors in #copy_data for input" do
+		@conn.exec "ROLLBACK"
+		@conn.transaction do
+			@conn.exec( "CREATE TEMP TABLE copytable (col1 INT)" )
+			expect {
+				@conn.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+					@conn.put_copy_data "xyz\n"
+				end
+			}.to raise_error(PG::Error, /invalid input syntax for .*integer/)
+		end
+		expect( @conn ).to still_be_usable
+	end
+
+	it "gracefully handle SQL statements while in #copy_data for input" do
+		@conn.exec "ROLLBACK"
+		@conn.transaction do
+			@conn.exec( "CREATE TEMP TABLE copytable (col1 INT)" )
+			expect {
+				@conn.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+					@conn.exec "SELECT 1"
+				end
+			}.to raise_error(PG::Error, /no COPY in progress/)
+		end
+		expect( @conn ).to still_be_usable
+	end
+
+	it "gracefully handle SQL statements while in #copy_data for output" do
+		@conn.exec "ROLLBACK"
+		@conn.transaction do
+			expect {
+				@conn.copy_data( "COPY (VALUES(1), (2)) TO STDOUT" ) do |res|
+					@conn.exec "SELECT 3"
+				end
+			}.to raise_error(PG::Error, /no COPY in progress/)
+		end
+		expect( @conn ).to still_be_usable
+	end
+
+	it "should raise an error for non copy statements in #copy_data" do
+		expect {
+			@conn.copy_data( "SELECT 1" ){}
+		}.to raise_error(ArgumentError, /no COPY/)
+
+		expect( @conn ).to still_be_usable
+	end
 
 	it "correctly finishes COPY queries passed to #async_exec" do
 		@conn.async_exec( "COPY (SELECT 1 UNION ALL SELECT 2) TO STDOUT" )
@@ -406,8 +751,8 @@ describe PG::Connection do
 			results << data if data
 		end until data.nil?
 
-		results.should have( 2 ).members
-		results.should include( "1\n", "2\n" )
+		expect( results.size ).to eq( 2 )
+		expect( results ).to include( "1\n", "2\n" )
 	end
 
 
@@ -419,54 +764,139 @@ describe PG::Connection do
 		end
 
 		sleep 0.5
-		t.should be_alive()
+		expect( t ).to be_alive()
 		@conn.cancel
 		t.join
-		(Time.now - start).should < 3
+		expect( (Time.now - start) ).to be < 3
 	end
 
 	it "described_class#block should allow a timeout" do
-		@conn.send_query( "select pg_sleep(3)" )
+		@conn.send_query( "select pg_sleep(100)" )
 
 		start = Time.now
-		@conn.block( 0.1 )
+		@conn.block( 0.3 )
 		finish = Time.now
+		@conn.cancel
 
-		(finish - start).should be_within( 0.05 ).of( 0.1 )
+		expect( (finish - start) ).to be_between( 0.2, 99 ).exclusive
+	end
+
+	it "can return the default connection options" do
+		expect( described_class.conndefaults ).to be_a( Array )
+		expect( described_class.conndefaults ).to all( be_a(Hash) )
+		expect( described_class.conndefaults[0] ).to include( :keyword, :label, :dispchar, :dispsize )
+		expect( @conn.conndefaults ).to eq( described_class.conndefaults )
+	end
+
+	it "can return the default connection options as a Hash" do
+		expect( described_class.conndefaults_hash ).to be_a( Hash )
+		expect( described_class.conndefaults_hash ).to include( :user, :password, :dbname, :host, :port )
+		expect( ['5432', '54321', @port.to_s] ).to include( described_class.conndefaults_hash[:port] )
+		expect( @conn.conndefaults_hash ).to eq( described_class.conndefaults_hash )
+	end
+
+	it "can return the connection's connection options", :postgresql_93 do
+		expect( @conn.conninfo ).to be_a( Array )
+		expect( @conn.conninfo ).to all( be_a(Hash) )
+		expect( @conn.conninfo[0] ).to include( :keyword, :label, :dispchar, :dispsize )
 	end
 
 
-	it "can encrypt a string given a password and username" do
-		described_class.encrypt_password("postgres", "postgres").
-			should =~ /\S+/
+	it "can return the connection's connection options as a Hash", :postgresql_93 do
+		expect( @conn.conninfo_hash ).to be_a( Hash )
+		expect( @conn.conninfo_hash ).to include( :user, :password, :connect_timeout, :dbname, :host )
+		expect( @conn.conninfo_hash[:dbname] ).to eq( 'test' )
+	end
+
+	describe "connection information related to SSL" do
+
+		it "can retrieve connection's ssl state", :postgresql_95 do
+			expect( @conn.ssl_in_use? ).to be false
+		end
+
+		it "can retrieve connection's ssl attribute_names", :postgresql_95 do
+			expect( @conn.ssl_attribute_names ).to be_a(Array)
+		end
+
+		it "can retrieve a single ssl connection attribute", :postgresql_95 do
+			expect( @conn.ssl_attribute('dbname') ).to eq( nil )
+		end
+
+		it "can retrieve all connection's ssl attributes", :postgresql_95 do
+			expect( @conn.ssl_attributes ).to be_a_kind_of( Hash )
+		end
 	end
 
 
-	it "raises an appropriate error if either of the required arguments for encrypt_password " +
-	   "is not valid" do
-		expect {
-			described_class.encrypt_password( nil, nil )
-		}.to raise_error( TypeError )
-		expect {
-			described_class.encrypt_password( "postgres", nil )
-		}.to raise_error( TypeError )
-		expect {
-			described_class.encrypt_password( nil, "postgres" )
-		}.to raise_error( TypeError )
+	it "honors the connect_timeout connection parameter", :postgresql_93 do
+		conn = PG.connect( port: @port, dbname: 'test', connect_timeout: 11 )
+		begin
+			expect( conn.conninfo_hash[:connect_timeout] ).to eq( "11" )
+		ensure
+			conn.finish
+		end
+	end
+
+	describe "deprecated password encryption method" do
+		it "can encrypt password for a given user" do
+			expect( described_class.encrypt_password("postgres", "postgres") ).to match( /\S+/ )
+		end
+
+		it "raises an appropriate error if either of the required arguments is not valid" do
+			expect {
+				described_class.encrypt_password( nil, nil )
+			}.to raise_error( TypeError )
+			expect {
+				described_class.encrypt_password( "postgres", nil )
+			}.to raise_error( TypeError )
+			expect {
+				described_class.encrypt_password( nil, "postgres" )
+			}.to raise_error( TypeError )
+		end
+	end
+
+	describe "password encryption method", :postgresql_10 do
+		it "can encrypt without algorithm" do
+			expect( @conn.encrypt_password("postgres", "postgres") ).to match( /\S+/ )
+			expect( @conn.encrypt_password("postgres", "postgres", nil) ).to match( /\S+/ )
+		end
+
+		it "can encrypt with algorithm" do
+			expect( @conn.encrypt_password("postgres", "postgres", "md5") ).to match( /md5\S+/i )
+			expect( @conn.encrypt_password("postgres", "postgres", "scram-sha-256") ).to match( /SCRAM-SHA-256\S+/i )
+		end
+
+		it "raises an appropriate error if either of the required arguments is not valid" do
+			expect {
+				@conn.encrypt_password( nil, nil )
+			}.to raise_error( TypeError )
+			expect {
+				@conn.encrypt_password( "postgres", nil )
+			}.to raise_error( TypeError )
+			expect {
+				@conn.encrypt_password( nil, "postgres" )
+			}.to raise_error( TypeError )
+			expect {
+				@conn.encrypt_password( "postgres", "postgres", :invalid )
+			}.to raise_error( TypeError )
+			expect {
+				@conn.encrypt_password( "postgres", "postgres", "invalid" )
+			}.to raise_error( PG::Error, /unrecognized/ )
+		end
 	end
 
 
 	it "allows fetching a column of values from a result by column number" do
 		res = @conn.exec( 'VALUES (1,2),(2,3),(3,4)' )
-		res.column_values( 0 ).should == %w[1 2 3]
-		res.column_values( 1 ).should == %w[2 3 4]
+		expect( res.column_values( 0 ) ).to eq( %w[1 2 3] )
+		expect( res.column_values( 1 ) ).to eq( %w[2 3 4] )
 	end
 
 
 	it "allows fetching a column of values from a result by field name" do
 		res = @conn.exec( 'VALUES (1,2),(2,3),(3,4)' )
-		res.field_values( 'column1' ).should == %w[1 2 3]
-		res.field_values( 'column2' ).should == %w[2 3 4]
+		expect( res.field_values( 'column1' ) ).to eq( %w[1 2 3] )
+		expect( res.field_values( 'column2' ) ).to eq( %w[2 3 4] )
 	end
 
 
@@ -494,175 +924,245 @@ describe PG::Connection do
 	end
 
 
-	it "can connect asynchronously", :unix do
+	it "handles server close while asynchronous connect" do
 		serv = TCPServer.new( '127.0.0.1', 54320 )
 		conn = described_class.connect_start( '127.0.0.1', 54320, "", "", "me", "xxxx", "somedb" )
-		[PG::PGRES_POLLING_WRITING, PG::CONNECTION_OK].should include conn.connect_poll
+		expect( [PG::PGRES_POLLING_WRITING, PG::CONNECTION_OK] ).to include conn.connect_poll
 		select( nil, [conn.socket_io], nil, 0.2 )
 		serv.close
 		if conn.connect_poll == PG::PGRES_POLLING_READING
 			select( [conn.socket_io], nil, nil, 0.2 )
 		end
-		conn.connect_poll.should == PG::PGRES_POLLING_FAILED
+		expect( conn.connect_poll ).to eq( PG::PGRES_POLLING_FAILED )
 	end
 
-	it "discards previous results (if any) before waiting on an #async_exec"
+	it "discards previous results at #discard_results" do
+		@conn.send_query( "select 1" )
+		@conn.discard_results
+		@conn.send_query( "select 41 as one" )
+		res = @conn.get_last_result
+		expect( res.to_a ).to eq( [{ 'one' => '41' }] )
+	end
 
-	it "calls the block if one is provided to #async_exec" do
+	it "discards previous results (if any) before waiting on #exec" do
+		@conn.send_query( "select 1" )
+		res = @conn.exec( "select 42 as one" )
+		expect( res.to_a ).to eq( [{ 'one' => '42' }] )
+	end
+
+	it "discards previous errors before waiting on #exec", :without_transaction do
+		@conn.send_query( "ERROR" )
+		res = @conn.exec( "select 43 as one" )
+		expect( res.to_a ).to eq( [{ 'one' => '43' }] )
+	end
+
+	it "calls the block if one is provided to #exec" do
 		result = nil
-		@conn.async_exec( "select 47 as one" ) do |pg_res|
+		@conn.exec( "select 47 as one" ) do |pg_res|
 			result = pg_res[0]
 		end
-		result.should == { 'one' => '47' }
+		expect( result ).to eq( { 'one' => '47' } )
 	end
 
 	it "raises a rescue-able error if #finish is called twice", :without_transaction do
 		conn = PG.connect( @conninfo )
 
 		conn.finish
-		expect { conn.finish }.to raise_error( PG::Error, /connection is closed/i )
+		expect { conn.finish }.to raise_error( PG::ConnectionBad, /connection is closed/i )
 	end
 
+	it "can use conn.reset to restart the connection" do
+		ios = IO.pipe
+		conn = PG.connect( @conninfo )
 
-	context "under PostgreSQL 9", :postgresql_90 do
+		# Close the two pipe file descriptors, so that the file descriptor of
+		# newly established connection is probably distinct from the previous one.
+		ios.each(&:close)
+		conn.reset
 
-		before( :each ) do
-			pending "only works with a PostgreSQL >= 9.0 server" if @conn.server_version < 9_00_00
-		end
-
-		it "sets the fallback_application_name on new connections" do
-			PG::Connection.parse_connect_args( 'dbname=test' ).should include( $0 )
-		end
-
-		it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
-		    "any number of arguments" do
-
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
-			conn.finish
-
-			event, pid, msg = nil
-			@conn.wait_for_notify( 10 ) do |*args|
-				event, pid, msg = *args
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			event.should == 'knees'
-			pid.should be_a_kind_of( Integer )
-			msg.should == 'skirt and boots'
-		end
-
-		it "accepts nil as the timeout in #wait_for_notify " do
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees} )
-			conn.finish
-
-			event, pid = nil
-			@conn.wait_for_notify( nil ) do |*args|
-				event, pid = *args
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			event.should == 'knees'
-			pid.should be_a_kind_of( Integer )
-		end
-
-		it "sends nil as the payload if the notification wasn't given one" do
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees} )
-			conn.finish
-
-			payload = :notnil
-			@conn.wait_for_notify( nil ) do |*args|
-				payload = args[ 2 ]
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			payload.should be_nil()
-		end
-
-		it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
-		   "two arguments" do
-
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
-			conn.finish
-
-			event, pid, msg = nil
-			@conn.wait_for_notify( 10 ) do |arg1, arg2|
-				event, pid, msg = arg1, arg2
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			event.should == 'knees'
-			pid.should be_a_kind_of( Integer )
-			msg.should be_nil()
-		end
-
-		it "calls the block supplied to wait_for_notify with the notify payload if it " +
-		   "doesn't accept arguments" do
-
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
-			conn.finish
-
-			notification_received = false
-			@conn.wait_for_notify( 10 ) do
-				notification_received = true
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			notification_received.should be_true()
-		end
-
-		it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
-		   "three arguments" do
-
-			@conn.exec( 'ROLLBACK' )
-			@conn.exec( 'LISTEN knees' )
-
-			conn = described_class.connect( @conninfo )
-			conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
-			conn.finish
-
-			event, pid, msg = nil
-			@conn.wait_for_notify( 10 ) do |arg1, arg2, arg3|
-				event, pid, msg = arg1, arg2, arg3
-			end
-			@conn.exec( 'UNLISTEN knees' )
-
-			event.should == 'knees'
-			pid.should be_a_kind_of( Integer )
-			msg.should == 'skirt and boots'
-		end
-
+		# The new connection should work even when the file descriptor has changed.
+		expect( conn.exec("SELECT 1").values ).to eq([["1"]])
+		conn.close
 	end
 
-	context "under PostgreSQL 9.1 client library", :postgresql_91, :without_transaction do
+	it "closes the IO fetched from #socket_io when the connection is closed", :without_transaction do
+		conn = PG.connect( @conninfo )
+		io = conn.socket_io
+		conn.finish
+		expect( io ).to be_closed()
+		expect { conn.socket_io }.to raise_error( PG::ConnectionBad, /connection is closed/i )
+	end
+
+	it "closes the IO fetched from #socket_io when the connection is reset", :without_transaction do
+		conn = PG.connect( @conninfo )
+		io = conn.socket_io
+		conn.reset
+		expect( io ).to be_closed()
+		expect( conn.socket_io ).to_not equal( io )
+		conn.finish
+	end
+
+	it "block should raise ConnectionBad for a closed connection" do
+		serv = TCPServer.new( '127.0.0.1', 54320 )
+		conn = described_class.connect_start( '127.0.0.1', 54320, "", "", "me", "xxxx", "somedb" )
+		while [PG::CONNECTION_STARTED, PG::CONNECTION_MADE].include?(conn.connect_poll)
+			sleep 0.1
+		end
+		serv.close
+		expect{ conn.block }.to raise_error(PG::ConnectionBad, /server closed the connection unexpectedly/)
+		expect{ conn.block }.to raise_error(PG::ConnectionBad, /can't get socket descriptor/)
+	end
+
+	it "sets the fallback_application_name on new connections" do
+		conn_string = PG::Connection.parse_connect_args( 'dbname=test' )
+
+		conn_name = conn_string[ /application_name='(.*?)'/, 1 ]
+		expect( conn_name ).to include( $0[0..10] )
+		expect( conn_name ).to include( $0[-10..-1] )
+		expect( conn_name.length ).to be <= 64
+	end
+
+	it "sets a shortened fallback_application_name on new connections" do
+		old_0 = $0
+		begin
+			$0 = "/this/is/a/very/long/path/with/many/directories/to/our/beloved/ruby"
+			conn_string = PG::Connection.parse_connect_args( 'dbname=test' )
+			conn_name = conn_string[ /application_name='(.*?)'/, 1 ]
+			expect( conn_name ).to include( $0[0..10] )
+			expect( conn_name ).to include( $0[-10..-1] )
+			expect( conn_name.length ).to be <= 64
+		ensure
+			$0 = old_0
+		end
+	end
+
+	it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
+			"any number of arguments" do
+
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
+		conn.finish
+
+		event, pid, msg = nil
+		@conn.wait_for_notify( 10 ) do |*args|
+			event, pid, msg = *args
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( event ).to eq( 'knees' )
+		expect( pid ).to be_a_kind_of( Integer )
+		expect( msg ).to eq( 'skirt and boots' )
+	end
+
+	it "accepts nil as the timeout in #wait_for_notify " do
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees} )
+		conn.finish
+
+		event, pid = nil
+		@conn.wait_for_notify( nil ) do |*args|
+			event, pid = *args
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( event ).to eq( 'knees' )
+		expect( pid ).to be_a_kind_of( Integer )
+	end
+
+	it "sends nil as the payload if the notification wasn't given one" do
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees} )
+		conn.finish
+
+		payload = :notnil
+		@conn.wait_for_notify( nil ) do |*args|
+			payload = args[ 2 ]
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( payload ).to be_nil()
+	end
+
+	it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
+			"two arguments" do
+
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
+		conn.finish
+
+		event, pid, msg = nil
+		@conn.wait_for_notify( 10 ) do |arg1, arg2|
+			event, pid, msg = arg1, arg2
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( event ).to eq( 'knees' )
+		expect( pid ).to be_a_kind_of( Integer )
+		expect( msg ).to be_nil()
+	end
+
+	it "calls the block supplied to wait_for_notify with the notify payload if it " +
+			"doesn't accept arguments" do
+
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
+		conn.finish
+
+		notification_received = false
+		@conn.wait_for_notify( 10 ) do
+			notification_received = true
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( notification_received ).to be_truthy()
+	end
+
+	it "calls the block supplied to wait_for_notify with the notify payload if it accepts " +
+			"three arguments" do
+
+		@conn.exec( 'ROLLBACK' )
+		@conn.exec( 'LISTEN knees' )
+
+		conn = described_class.connect( @conninfo )
+		conn.exec( %Q{NOTIFY knees, 'skirt and boots'} )
+		conn.finish
+
+		event, pid, msg = nil
+		@conn.wait_for_notify( 10 ) do |arg1, arg2, arg3|
+			event, pid, msg = arg1, arg2, arg3
+		end
+		@conn.exec( 'UNLISTEN knees' )
+
+		expect( event ).to eq( 'knees' )
+		expect( pid ).to be_a_kind_of( Integer )
+		expect( msg ).to eq( 'skirt and boots' )
+	end
+
+	context "server ping", :without_transaction do
 
 		it "pings successfully with connection string" do
 			ping = described_class.ping(@conninfo)
-			ping.should == PG::PQPING_OK
+			expect( ping ).to eq( PG::PQPING_OK )
 		end
 
 		it "pings using 7 arguments converted to strings" do
 			ping = described_class.ping('localhost', @port, nil, nil, :test, nil, nil)
-			ping.should == PG::PQPING_OK
+			expect( ping ).to eq( PG::PQPING_OK )
 		end
 
 		it "pings using a hash of connection parameters" do
@@ -670,7 +1170,7 @@ describe PG::Connection do
 				:host => 'localhost',
 				:port => @port,
 				:dbname => :test)
-			ping.should == PG::PQPING_OK
+			expect( ping ).to eq( PG::PQPING_OK )
 		end
 
 		it "returns correct response when ping connection cannot be established" do
@@ -678,169 +1178,359 @@ describe PG::Connection do
 				:host => 'localhost',
 				:port => 9999,
 				:dbname => :test)
-			ping.should == PG::PQPING_NO_RESPONSE
+			expect( ping ).to eq( PG::PQPING_NO_RESPONSE )
+		end
+
+		it "returns error when ping connection arguments are wrong" do
+			ping = described_class.ping('localhost', 'localhost', nil, nil, :test, nil, nil)
+			expect( ping ).to_not eq( PG::PQPING_OK )
 		end
 
 		it "returns correct response when ping connection arguments are wrong" do
-			ping = described_class.ping('localhost', 'localhost', nil, nil, :test, nil, nil)
-			ping.should == PG::PQPING_NO_ATTEMPT
+			ping = described_class.ping(
+				:host => 'localhost',
+				:invalid_option => 9999,
+				:dbname => :test)
+			expect( ping ).to eq( PG::PQPING_NO_ATTEMPT )
 		end
-
 
 	end
 
-	context "under PostgreSQL 9.2 client library", :postgresql_92 do
-		describe "set_single_row_mode" do
+	describe "set_single_row_mode" do
 
-			it "raises an error when called at the wrong time" do
-				expect {
-					@conn.set_single_row_mode
-				}.to raise_error(PG::Error)
-			end
-
-			it "should work in single row mode" do
-				@conn.send_query( "SELECT generate_series(1,10)" )
+		it "raises an error when called at the wrong time" do
+			expect {
 				@conn.set_single_row_mode
+			}.to raise_error(PG::Error)
+		end
 
-				results = []
-				loop do
-					@conn.block
-					res = @conn.get_result or break
-					results << res
-				end
-				results.length.should == 11
-				results[0..-2].each do |res|
-					res.result_status.should == PG::PGRES_SINGLE_TUPLE
-					values = res.field_values('generate_series')
-					values.length.should == 1
-					values.first.to_i.should > 0
-				end
-				results.last.result_status.should == PG::PGRES_TUPLES_OK
-				results.last.ntuples.should == 0
+		it "should work in single row mode" do
+			@conn.send_query( "SELECT generate_series(1,10)" )
+			@conn.set_single_row_mode
+
+			results = []
+			loop do
+				@conn.block
+				res = @conn.get_result or break
+				results << res
 			end
+			expect( results.length ).to eq( 11 )
+			results[0..-2].each do |res|
+				expect( res.result_status ).to eq( PG::PGRES_SINGLE_TUPLE )
+				values = res.field_values('generate_series')
+				expect( values.length ).to eq( 1 )
+				expect( values.first.to_i ).to be > 0
+			end
+			expect( results.last.result_status ).to eq( PG::PGRES_TUPLES_OK )
+			expect( results.last.ntuples ).to eq( 0 )
+		end
 
-			it "should receive rows before entire query is finished" do
-				@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, pg_sleep(1);" )
-				@conn.set_single_row_mode
+		it "should receive rows before entire query is finished" do
+			@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, pg_sleep(1);" )
+			@conn.set_single_row_mode
 
-				start_time = Time.now
-				first_row_time = nil
+			start_time = Time.now
+			first_row_time = nil
+			loop do
+				res = @conn.get_result or break
+				res.check
+				first_row_time = Time.now unless first_row_time
+			end
+			expect( (Time.now - start_time) ).to be >= 0.9
+			expect( (first_row_time - start_time) ).to be < 0.9
+		end
+
+		it "should receive rows before entire query fails" do
+			@conn.exec( "CREATE FUNCTION errfunc() RETURNS int AS $$ BEGIN RAISE 'test-error'; END; $$ LANGUAGE plpgsql;" )
+			@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, errfunc();" )
+			@conn.set_single_row_mode
+
+			first_result = nil
+			expect do
 				loop do
 					res = @conn.get_result or break
 					res.check
-					first_row_time = Time.now unless first_row_time
+					first_result ||= res
 				end
-				(Time.now - start_time).should >= 1.0
-				(first_row_time - start_time).should < 1.0
-			end
-
-			it "should receive rows before entire query fails" do
-				@conn.exec( "CREATE FUNCTION errfunc() RETURNS int AS $$ BEGIN RAISE 'test-error'; END; $$ LANGUAGE plpgsql;" )
-				@conn.send_query( "SELECT generate_series(0,999), NULL UNION ALL SELECT 1000, errfunc();" )
-				@conn.set_single_row_mode
-
-				first_result = nil
-				expect do
-					loop do
-						res = @conn.get_result or break
-						res.check
-						first_result ||= res
-					end
-				end.to raise_error(PG::Error)
-				first_result.kind_of?(PG::Result).should be_true
-				first_result.result_status.should == PG::PGRES_SINGLE_TUPLE
-			end
+			end.to raise_error(PG::Error)
+			expect( first_result.kind_of?(PG::Result) ).to be_truthy
+			expect( first_result.result_status ).to eq( PG::PGRES_SINGLE_TUPLE )
 		end
+
 	end
 
-	context "multinationalization support", :ruby_19 do
+	context "multinationalization support" do
 
 		describe "rubyforge #22925: m17n support" do
 			it "should return results in the same encoding as the client (iso-8859-1)" do
-				out_string = nil
-				@conn.transaction do |conn|
-					conn.internal_encoding = 'iso8859-1'
-					res = conn.exec("VALUES ('fantasia')", [], 0)
-					out_string = res[0]['column1']
-				end
-				out_string.should == 'fantasia'
-				out_string.encoding.should == Encoding::ISO8859_1
+				@conn.internal_encoding = 'iso8859-1'
+				res = @conn.exec_params("VALUES ('fantasia')", [], 0)
+				out_string = res[0]['column1']
+				expect( out_string ).to eq( 'fantasia' )
+				expect( out_string.encoding ).to eq( Encoding::ISO8859_1 )
 			end
 
 			it "should return results in the same encoding as the client (utf-8)" do
-				out_string = nil
-				@conn.transaction do |conn|
-					conn.internal_encoding = 'utf-8'
-					res = conn.exec("VALUES ('世界線航跡蔵')", [], 0)
-					out_string = res[0]['column1']
-				end
-				out_string.should == '世界線航跡蔵'
-				out_string.encoding.should == Encoding::UTF_8
+				@conn.internal_encoding = 'utf-8'
+				res = @conn.exec_params("VALUES ('世界線航跡蔵')", [], 0)
+				out_string = res[0]['column1']
+				expect( out_string ).to eq( '世界線航跡蔵' )
+				expect( out_string.encoding ).to eq( Encoding::UTF_8 )
 			end
 
 			it "should return results in the same encoding as the client (EUC-JP)" do
-				out_string = nil
-				@conn.transaction do |conn|
-					conn.internal_encoding = 'EUC-JP'
-					stmt = "VALUES ('世界線航跡蔵')".encode('EUC-JP')
-					res = conn.exec(stmt, [], 0)
-					out_string = res[0]['column1']
-				end
-				out_string.should == '世界線航跡蔵'.encode('EUC-JP')
-				out_string.encoding.should == Encoding::EUC_JP
+				@conn.internal_encoding = 'EUC-JP'
+				stmt = "VALUES ('世界線航跡蔵')".encode('EUC-JP')
+				res = @conn.exec_params(stmt, [], 0)
+				out_string = res[0]['column1']
+				expect( out_string ).to eq( '世界線航跡蔵'.encode('EUC-JP') )
+				expect( out_string.encoding ).to eq( Encoding::EUC_JP )
 			end
 
 			it "returns the results in the correct encoding even if the client_encoding has " +
 			   "changed since the results were fetched" do
-				out_string = nil
-				@conn.transaction do |conn|
-					conn.internal_encoding = 'EUC-JP'
-					stmt = "VALUES ('世界線航跡蔵')".encode('EUC-JP')
-					res = conn.exec(stmt, [], 0)
-					conn.internal_encoding = 'utf-8'
-					out_string = res[0]['column1']
-				end
-				out_string.should == '世界線航跡蔵'.encode('EUC-JP')
-				out_string.encoding.should == Encoding::EUC_JP
+				@conn.internal_encoding = 'EUC-JP'
+				stmt = "VALUES ('世界線航跡蔵')".encode('EUC-JP')
+				res = @conn.exec_params(stmt, [], 0)
+				@conn.internal_encoding = 'utf-8'
+				out_string = res[0]['column1']
+				expect( out_string ).to eq( '世界線航跡蔵'.encode('EUC-JP') )
+				expect( out_string.encoding ).to eq( Encoding::EUC_JP )
 			end
 
 			it "the connection should return ASCII-8BIT when it's set to SQL_ASCII" do
 				@conn.exec "SET client_encoding TO SQL_ASCII"
-				@conn.internal_encoding.should == Encoding::ASCII_8BIT
+				expect( @conn.internal_encoding ).to eq( Encoding::ASCII_8BIT )
 			end
 
-			it "works around the unsupported JOHAB encoding by returning stuff in 'ASCII_8BIT'" do
-				pending "figuring out how to create a string in the JOHAB encoding" do
-					out_string = nil
-					@conn.transaction do |conn|
-						conn.exec( "set client_encoding = 'JOHAB';" )
-						stmt = "VALUES ('foo')".encode('JOHAB')
-						res = conn.exec( stmt, [], 0 )
-						out_string = res[0]['column1']
-					end
-					out_string.should == 'foo'.encode( Encoding::ASCII_8BIT )
-					out_string.encoding.should == Encoding::ASCII_8BIT
-				end
+			it "the connection should use JOHAB dummy encoding when it's set to JOHAB" do
+				@conn.set_client_encoding "JOHAB"
+				val = @conn.exec("SELECT chr(x'3391'::int)").values[0][0]
+				expect( val.encoding.name ).to eq( "JOHAB" )
+				expect( val.unpack("H*")[0] ).to eq( "dc65" )
+			end
+
+			it "can retrieve server encoding as text" do
+				enc = @conn.parameter_status "server_encoding"
+				expect( enc ).to eq( "UTF8" )
+			end
+
+			it "can retrieve server encoding as ruby encoding" do
+				expect( @conn.external_encoding ).to eq( Encoding::UTF_8 )
 			end
 
 			it "uses the client encoding for escaped string" do
-				original = "string to escape".force_encoding( "euc-jp" )
+				original = "Möhre to 'scape".encode( "utf-16be" )
 				@conn.set_client_encoding( "euc_jp" )
 				escaped  = @conn.escape( original )
-				escaped.encoding.should == Encoding::EUC_JP
+				expect( escaped.encoding ).to eq( Encoding::EUC_JP )
+				expect( escaped ).to eq( "Möhre to ''scape".encode(Encoding::EUC_JP) )
 			end
 
-			it "escapes string as literal", :postgresql_90 do
-				original = "string to\0 escape"
+			it "uses the client encoding for escaped literal" do
+				original = "Möhre to 'scape".encode( "utf-16be" )
+				@conn.set_client_encoding( "euc_jp" )
 				escaped  = @conn.escape_literal( original )
-				escaped.should == "'string to'"
+				expect( escaped.encoding ).to eq( Encoding::EUC_JP )
+				expect( escaped ).to eq( "'Möhre to ''scape'".encode(Encoding::EUC_JP) )
+			end
+
+			it "uses the client encoding for escaped identifier" do
+				original = "Möhre to 'scape".encode( "utf-16le" )
+				@conn.set_client_encoding( "euc_jp" )
+				escaped  = @conn.escape_identifier( original )
+				expect( escaped.encoding ).to eq( Encoding::EUC_JP )
+				expect( escaped ).to eq( "\"Möhre to 'scape\"".encode(Encoding::EUC_JP) )
+			end
+
+			it "uses the client encoding for quote_ident" do
+				original = "Möhre to 'scape".encode( "utf-16le" )
+				@conn.set_client_encoding( "euc_jp" )
+				escaped  = @conn.quote_ident( original )
+				expect( escaped.encoding ).to eq( Encoding::EUC_JP )
+				expect( escaped ).to eq( "\"Möhre to 'scape\"".encode(Encoding::EUC_JP) )
+			end
+
+			it "uses the previous string encoding for escaped string" do
+				original = "Möhre to 'scape".encode( "iso-8859-1" )
+				@conn.set_client_encoding( "euc_jp" )
+				escaped  = described_class.escape( original )
+				expect( escaped.encoding ).to eq( Encoding::ISO8859_1 )
+				expect( escaped ).to eq( "Möhre to ''scape".encode(Encoding::ISO8859_1) )
+			end
+
+			it "uses the previous string encoding for quote_ident" do
+				original = "Möhre to 'scape".encode( "iso-8859-1" )
+				@conn.set_client_encoding( "euc_jp" )
+				escaped  = described_class.quote_ident( original )
+				expect( escaped.encoding ).to eq( Encoding::ISO8859_1 )
+				expect( escaped.encode ).to eq( "\"Möhre to 'scape\"".encode(Encoding::ISO8859_1) )
+			end
+
+			it "raises appropriate error if set_client_encoding is called with invalid arguments" do
+				expect { @conn.set_client_encoding( "invalid" ) }.to raise_error(PG::Error, /invalid value/)
+				expect { @conn.set_client_encoding( :invalid ) }.to raise_error(TypeError)
+				expect { @conn.set_client_encoding( nil ) }.to raise_error(TypeError)
+			end
+
+			it "can use an encoding with high index for client encoding" do
+				# Allocate a lot of encoding indices, so that MRI's ENCODING_INLINE_MAX is exceeded
+				unless Encoding.name_list.include?("pgtest-0")
+					256.times do |eidx|
+						Encoding::UTF_8.replicate("pgtest-#{eidx}")
+					end
+				end
+
+				# Now allocate the JOHAB encoding with an unusual high index
+				@conn.set_client_encoding "JOHAB"
+				val = @conn.exec("SELECT chr(x'3391'::int)").values[0][0]
+				expect( val.encoding.name ).to eq( "JOHAB" )
+			end
+
+		end
+
+		describe "respect and convert character encoding of input strings" do
+			before :each do
+				@conn.internal_encoding = __ENCODING__
+			end
+
+			it "should convert query string and parameters to #exec_params" do
+				r = @conn.exec_params("VALUES( $1, $2, $1=$2, 'grün')".encode("utf-16le"),
+				                  ['grün'.encode('utf-16be'), 'grün'.encode('iso-8859-1')])
+				expect( r.values ).to eq( [['grün', 'grün', 't', 'grün']] )
+			end
+
+			it "should convert query string to #exec" do
+				r = @conn.exec("SELECT 'grün'".encode("utf-16be"))
+				expect( r.values ).to eq( [['grün']] )
+			end
+
+			it "should convert strings and parameters to #prepare and #exec_prepared" do
+				@conn.prepare("weiß1".encode("utf-16be"), "VALUES( $1, $2, $1=$2, 'grün')".encode("cp850"))
+				r = @conn.exec_prepared("weiß1".encode("utf-32le"),
+				                ['grün'.encode('cp936'), 'grün'.encode('utf-16le')])
+				expect( r.values ).to eq( [['grün', 'grün', 't', 'grün']] )
+			end
+
+			it "should convert strings to #describe_prepared" do
+				@conn.prepare("weiß2", "VALUES(123)")
+				r = @conn.describe_prepared("weiß2".encode("utf-16be"))
+				expect( r.nfields ).to eq( 1 )
+			end
+
+			it "should convert strings to #describe_portal" do
+				@conn.exec "DECLARE cörsör CURSOR FOR VALUES(1,2,3)"
+				r = @conn.describe_portal("cörsör".encode("utf-16le"))
+				expect( r.nfields ).to eq( 3 )
+			end
+
+			it "should convert query string to #send_query" do
+				@conn.send_query("VALUES('grün')".encode("utf-16be"))
+				expect( @conn.get_last_result.values ).to eq( [['grün']] )
+			end
+
+			it "should convert query string and parameters to #send_query_params" do
+				@conn.send_query_params("VALUES( $1, $2, $1=$2, 'grün')".encode("utf-16le"),
+				                  ['grün'.encode('utf-32be'), 'grün'.encode('iso-8859-1')])
+				expect( @conn.get_last_result.values ).to eq( [['grün', 'grün', 't', 'grün']] )
+			end
+
+			it "should convert strings and parameters to #send_prepare and #send_query_prepared" do
+				@conn.send_prepare("weiß3".encode("iso-8859-1"), "VALUES( $1, $2, $1=$2, 'grün')".encode("utf-16be"))
+				@conn.get_last_result
+				@conn.send_query_prepared("weiß3".encode("utf-32le"),
+				                ['grün'.encode('utf-16le'), 'grün'.encode('iso-8859-1')])
+				expect( @conn.get_last_result.values ).to eq( [['grün', 'grün', 't', 'grün']] )
+			end
+
+			it "should convert strings to #send_describe_prepared" do
+				@conn.prepare("weiß4", "VALUES(123)")
+				@conn.send_describe_prepared("weiß4".encode("utf-16be"))
+				expect( @conn.get_last_result.nfields ).to eq( 1 )
+			end
+
+			it "should convert strings to #send_describe_portal" do
+				@conn.exec "DECLARE cörsör CURSOR FOR VALUES(1,2,3)"
+				@conn.send_describe_portal("cörsör".encode("utf-16le"))
+				expect( @conn.get_last_result.nfields ).to eq( 3 )
+			end
+
+			it "should convert error string to #put_copy_end" do
+				@conn.exec( "CREATE TEMP TABLE copytable (col1 TEXT)" )
+				@conn.exec( "COPY copytable FROM STDIN" )
+				@conn.put_copy_end("grün".encode("utf-16be"))
+				expect( @conn.get_result.error_message ).to match(/grün/)
+				@conn.get_result
 			end
 		end
 
+		it "rejects command strings with zero bytes" do
+			expect{ @conn.exec( "SELECT 1;\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.exec_params( "SELECT 1;\x00", [] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.prepare( "abc\x00", "SELECT 1;" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.prepare( "abc", "SELECT 1;\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.exec_prepared( "abc\x00", [] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.describe_prepared( "abc\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.describe_portal( "abc\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_query( "SELECT 1;\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_query_params( "SELECT 1;\x00", [] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_prepare( "abc\x00", "SELECT 1;" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_prepare( "abc", "SELECT 1;\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_query_prepared( "abc\x00", [] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_describe_prepared( "abc\x00" ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_describe_portal( "abc\x00" ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects query params with zero bytes" do
+			expect{ @conn.exec_params( "SELECT 1;\x00", ["ab\x00"] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.exec_prepared( "abc\x00", ["ab\x00"] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_query_params( "SELECT 1;\x00", ["ab\x00"] ) }.to raise_error(ArgumentError, /null byte/)
+			expect{ @conn.send_query_prepared( "abc\x00", ["ab\x00"] ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects string with zero bytes in escape" do
+			expect{ @conn.escape( "ab\x00cd" ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects string with zero bytes in escape_literal" do
+			expect{ @conn.escape_literal( "ab\x00cd" ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects string with zero bytes in escape_identifier" do
+			expect{ @conn.escape_identifier( "ab\x00cd" ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects string with zero bytes in quote_ident" do
+			expect{ described_class.quote_ident( "ab\x00cd" ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "rejects Array with string with zero bytes" do
+			original = ["xyz", "2\x00"]
+			expect{ described_class.quote_ident( original ) }.to raise_error(ArgumentError, /null byte/)
+		end
+
+		it "can quote bigger strings with quote_ident" do
+			original = "'01234567\"" * 100
+			escaped = described_class.quote_ident( original )
+			expect( escaped ).to eq( "\"" + original.gsub("\"", "\"\"") + "\"" )
+		end
+
+		it "can quote Arrays with quote_ident" do
+			original = "'01234567\""
+			escaped = described_class.quote_ident( [original]*3 )
+			expected = ["\"" + original.gsub("\"", "\"\"") + "\""] * 3
+			expect( escaped ).to eq( expected.join(".") )
+		end
+
+		it "will raise a TypeError for invalid arguments to quote_ident" do
+			expect{ described_class.quote_ident( nil ) }.to raise_error(TypeError)
+			expect{ described_class.quote_ident( [nil] ) }.to raise_error(TypeError)
+			expect{ described_class.quote_ident( [['a']] ) }.to raise_error(TypeError)
+		end
 
 		describe "Ruby 1.9.x default_internal encoding" do
 
-			it "honors the Encoding.default_internal if it's set and the synchronous interface is used" do
+			it "honors the Encoding.default_internal if it's set and the synchronous interface is used", :without_transaction do
 				@conn.transaction do |txn_conn|
 					txn_conn.internal_encoding = Encoding::ISO8859_1
 					txn_conn.exec( "CREATE TABLE defaultinternaltest ( foo text )" )
@@ -849,13 +1539,14 @@ describe PG::Connection do
 
 				begin
 					prev_encoding = Encoding.default_internal
-					Encoding.default_internal = Encoding::UTF_8
+					Encoding.default_internal = Encoding::ISO8859_2
 
 					conn = PG.connect( @conninfo )
-					conn.internal_encoding.should == Encoding::UTF_8
+					expect( conn.internal_encoding ).to eq( Encoding::ISO8859_2 )
 					res = conn.exec( "SELECT foo FROM defaultinternaltest" )
-					res[0]['foo'].encoding.should == Encoding::UTF_8
+					expect( res[0]['foo'].encoding ).to eq( Encoding::ISO8859_2 )
 				ensure
+					conn.exec( "DROP TABLE defaultinternaltest" )
 					conn.finish if conn
 					Encoding.default_internal = prev_encoding
 				end
@@ -868,7 +1559,7 @@ describe PG::Connection do
 
 					@conn.set_default_encoding
 
-					@conn.internal_encoding.should == Encoding::KOI8_R
+					expect( @conn.internal_encoding ).to eq( Encoding::KOI8_R )
 				ensure
 					Encoding.default_internal = prev_encoding
 				end
@@ -889,7 +1580,7 @@ describe PG::Connection do
 					query = "INSERT INTO foo VALUES ('Côte d'Ivoire')".encode( 'iso-8859-15' )
 					conn.exec( query )
 				rescue => err
-					err.message.encoding.should == Encoding::ISO8859_15
+					expect( err.message.encoding ).to eq( Encoding::ISO8859_15 )
 				else
 					fail "No exception raised?!"
 				end
@@ -898,7 +1589,22 @@ describe PG::Connection do
 			conn.finish if conn
 		end
 
-		it "receives properly encoded messages in the notice callbacks", :postgresql_90 do
+		it "handles clearing result in or after set_notice_receiver" do
+			r = nil
+			@conn.set_notice_receiver do |result|
+				r = result
+				expect( r.cleared? ).to eq(false)
+			end
+			@conn.exec "do $$ BEGIN RAISE NOTICE 'foo'; END; $$ LANGUAGE plpgsql;"
+			sleep 0.2
+			expect( r ).to be_a( PG::Result )
+			expect( r.cleared? ).to eq(true)
+			expect( r.autoclear? ).to eq(true)
+			r.clear
+			@conn.set_notice_receiver
+		end
+
+		it "receives properly encoded messages in the notice callbacks" do
 			[:receiver, :processor].each do |kind|
 				notices = []
 				@conn.internal_encoding = 'utf-8'
@@ -916,19 +1622,18 @@ describe PG::Connection do
 					@conn.exec "do $$ BEGIN RAISE NOTICE '世界線航跡蔵'; END; $$ LANGUAGE plpgsql;"
 				end
 
-				notices.length.should == 3
+				expect( notices.length ).to eq( 3 )
 				notices.each do |notice|
-					notice.should =~ /^NOTICE:.*世界線航跡蔵/
-					notice.encoding.should == Encoding::UTF_8
+					expect( notice ).to match( /^NOTICE:.*世界線航跡蔵/ )
+					expect( notice.encoding ).to eq( Encoding::UTF_8 )
 				end
 				@conn.set_notice_receiver
 				@conn.set_notice_processor
 			end
 		end
 
-		it "receives properly encoded text from wait_for_notify", :postgresql_90 do
+		it "receives properly encoded text from wait_for_notify", :without_transaction do
 			@conn.internal_encoding = 'utf-8'
-			@conn.exec( 'ROLLBACK' )
 			@conn.exec( 'LISTEN "Möhre"' )
 			@conn.exec( %Q{NOTIFY "Möhre", '世界線航跡蔵'} )
 			event, pid, msg = nil
@@ -937,37 +1642,330 @@ describe PG::Connection do
 			end
 			@conn.exec( 'UNLISTEN "Möhre"' )
 
-			event.should == "Möhre"
-			event.encoding.should == Encoding::UTF_8
-			msg.should == '世界線航跡蔵'
-			msg.encoding.should == Encoding::UTF_8
+			expect( event ).to eq( "Möhre" )
+			expect( event.encoding ).to eq( Encoding::UTF_8 )
+			expect( pid ).to be_a_kind_of(Integer)
+			expect( msg ).to eq( '世界線航跡蔵' )
+			expect( msg.encoding ).to eq( Encoding::UTF_8 )
 		end
 
-		it "returns properly encoded text from notifies", :postgresql_90 do
+		it "returns properly encoded text from notifies", :without_transaction do
 			@conn.internal_encoding = 'utf-8'
-			@conn.exec( 'ROLLBACK' )
 			@conn.exec( 'LISTEN "Möhre"' )
 			@conn.exec( %Q{NOTIFY "Möhre", '世界線航跡蔵'} )
 			@conn.exec( 'UNLISTEN "Möhre"' )
 
 			notification = @conn.notifies
-			notification[:relname].should == "Möhre"
-			notification[:relname].encoding.should == Encoding::UTF_8
-			notification[:extra].should == '世界線航跡蔵'
-			notification[:extra].encoding.should == Encoding::UTF_8
-			notification[:be_pid].should > 0
+			expect( notification[:relname] ).to eq( "Möhre" )
+			expect( notification[:relname].encoding ).to eq( Encoding::UTF_8 )
+			expect( notification[:extra] ).to eq( '世界線航跡蔵' )
+			expect( notification[:extra].encoding ).to eq( Encoding::UTF_8 )
+			expect( notification[:be_pid] ).to be > 0
 		end
 	end
 
-	context "OS thread support", :ruby_19 do
-		it "described_class#exec shouldn't block a second thread" do
+	context "OS thread support" do
+		it "Connection#exec shouldn't block a second thread" do
 			t = Thread.new do
 				@conn.exec( "select pg_sleep(1)" )
 			end
 
 			sleep 0.5
-			t.should be_alive()
+			expect( t ).to be_alive()
 			t.join
+		end
+
+		it "Connection.new shouldn't block a second thread" do
+			serv = nil
+			t = Thread.new do
+				serv = TCPServer.new( '127.0.0.1', 54320 )
+				expect {
+					described_class.new( '127.0.0.1', 54320, "", "", "me", "xxxx", "somedb" )
+				}.to raise_error(PG::ConnectionBad, /server closed the connection unexpectedly/)
+			end
+
+			sleep 0.5
+			expect( t ).to be_alive()
+			serv.close
+			t.join
+		end
+	end
+
+	describe "type casting" do
+		it "should raise an error on invalid param mapping" do
+			expect{
+				@conn.exec_params( "SELECT 1", [], nil, :invalid )
+			}.to raise_error(TypeError)
+		end
+
+		it "should return nil if no type mapping is set" do
+			expect( @conn.type_map_for_queries ).to be_kind_of(PG::TypeMapAllStrings)
+			expect( @conn.type_map_for_results ).to be_kind_of(PG::TypeMapAllStrings)
+		end
+
+		it "shouldn't type map params unless requested" do
+			if @conn.server_version < 100000
+				expect{
+					@conn.exec_params( "SELECT $1", [5] )
+				}.to raise_error(PG::IndeterminateDatatype)
+			else
+				# PostgreSQL-10 maps to TEXT type (OID 25)
+				expect( @conn.exec_params( "SELECT $1", [5] ).ftype(0)).to eq(25)
+			end
+		end
+
+		it "should raise an error on invalid encoder to put_copy_data" do
+			expect{
+				@conn.put_copy_data [1], :invalid
+			}.to raise_error(TypeError)
+		end
+
+		it "can type cast parameters to put_copy_data with explicit encoder" do
+			tm = PG::TypeMapByColumn.new [nil]
+			row_encoder = PG::TextEncoder::CopyRow.new type_map: tm
+
+			@conn.exec( "CREATE TEMP TABLE copytable (col1 TEXT)" )
+			@conn.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+				@conn.put_copy_data [1], row_encoder
+				@conn.put_copy_data ["2"], row_encoder
+			end
+
+			@conn.copy_data( "COPY copytable FROM STDOUT", row_encoder ) do |res|
+				@conn.put_copy_data [3]
+				@conn.put_copy_data ["4"]
+			end
+
+			res = @conn.exec( "SELECT * FROM copytable ORDER BY col1" )
+			expect( res.values ).to eq( [["1"], ["2"], ["3"], ["4"]] )
+		end
+
+		context "with default query type map" do
+			before :each do
+				@conn2 = described_class.new(@conninfo)
+				tm = PG::TypeMapByClass.new
+				tm[Integer] = PG::TextEncoder::Integer.new oid: 20
+				@conn2.type_map_for_queries = tm
+
+				row_encoder = PG::TextEncoder::CopyRow.new type_map: tm
+				@conn2.encoder_for_put_copy_data = row_encoder
+			end
+			after :each do
+				@conn2.close
+			end
+
+			it "should respect a type mapping for params and it's OID and format code" do
+				res = @conn2.exec_params( "SELECT $1", [5] )
+				expect( res.values ).to eq( [["5"]] )
+				expect( res.ftype(0) ).to eq( 20 )
+			end
+
+			it "should return the current type mapping" do
+				expect( @conn2.type_map_for_queries ).to be_kind_of(PG::TypeMapByClass)
+			end
+
+			it "should work with arbitrary number of params in conjunction with type casting" do
+				begin
+					3.step( 12, 0.2 ) do |exp|
+						num_params = (2 ** exp).to_i
+						sql = num_params.times.map{|n| "$#{n+1}" }.join(",")
+						params = num_params.times.to_a
+						res = @conn2.exec_params( "SELECT #{sql}", params )
+						expect( res.nfields ).to eq( num_params )
+						expect( res.values ).to eq( [num_params.times.map(&:to_s)] )
+					end
+				rescue PG::ProgramLimitExceeded
+					# Stop silently as soon the server complains about too many params
+				end
+			end
+
+			it "can process #copy_data input queries with row encoder and respects character encoding" do
+				@conn2.exec( "CREATE TEMP TABLE copytable (col1 TEXT)" )
+				@conn2.copy_data( "COPY copytable FROM STDOUT" ) do |res|
+					@conn2.put_copy_data [1]
+					@conn2.put_copy_data ["Möhre".encode("utf-16le")]
+				end
+
+				res = @conn2.exec( "SELECT * FROM copytable ORDER BY col1" )
+				expect( res.values ).to eq( [["1"], ["Möhre"]] )
+			end
+		end
+
+		context "with default result type map" do
+			before :each do
+				@conn2 = described_class.new(@conninfo)
+				tm = PG::TypeMapByOid.new
+				tm.add_coder PG::TextDecoder::Integer.new oid: 23, format: 0
+				@conn2.type_map_for_results = tm
+
+				row_decoder = PG::TextDecoder::CopyRow.new
+				@conn2.decoder_for_get_copy_data = row_decoder
+			end
+			after :each do
+				@conn2.close
+			end
+
+			it "should respect a type mapping for result" do
+				res = @conn2.exec_params( "SELECT $1::INT", ["5"] )
+				expect( res.values ).to eq( [[5]] )
+			end
+
+			it "should return the current type mapping" do
+				expect( @conn2.type_map_for_results ).to be_kind_of(PG::TypeMapByOid)
+			end
+
+			it "should work with arbitrary number of params in conjunction with type casting" do
+				begin
+					3.step( 12, 0.2 ) do |exp|
+						num_params = (2 ** exp).to_i
+						sql = num_params.times.map{|n| "$#{n+1}::INT" }.join(",")
+						params = num_params.times.to_a
+						res = @conn2.exec_params( "SELECT #{sql}", params )
+						expect( res.nfields ).to eq( num_params )
+						expect( res.values ).to eq( [num_params.times.to_a] )
+					end
+				rescue PG::ProgramLimitExceeded
+					# Stop silently as soon the server complains about too many params
+				end
+			end
+
+			it "can process #copy_data output with row decoder and respects character encoding" do
+				@conn2.internal_encoding = Encoding::ISO8859_1
+				rows = []
+				@conn2.copy_data( "COPY (VALUES('1'), ('Möhre')) TO STDOUT".encode("utf-16le") ) do |res|
+					while row=@conn2.get_copy_data
+						rows << row
+					end
+				end
+				expect( rows.last.last.encoding ).to eq( Encoding::ISO8859_1 )
+				expect( rows ).to eq( [["1"], ["Möhre".encode("iso-8859-1")]] )
+			end
+
+			it "can type cast #copy_data output with explicit decoder" do
+				tm = PG::TypeMapByColumn.new [PG::TextDecoder::Integer.new]
+				row_decoder = PG::TextDecoder::CopyRow.new type_map: tm
+				rows = []
+				@conn.copy_data( "COPY (SELECT 1 UNION ALL SELECT 2) TO STDOUT", row_decoder ) do |res|
+					while row=@conn.get_copy_data
+						rows << row
+					end
+				end
+				@conn.copy_data( "COPY (SELECT 3 UNION ALL SELECT 4) TO STDOUT" ) do |res|
+					while row=@conn.get_copy_data( false, row_decoder )
+						rows << row
+					end
+				end
+				expect( rows ).to eq( [[1], [2], [3], [4]] )
+			end
+		end
+	end
+
+	describe :field_name_type do
+		before :each do
+			@conn2 = PG.connect(@conninfo)
+		end
+		after :each do
+			@conn2.close
+		end
+
+		it "uses string field names per default" do
+			expect(@conn2.field_name_type).to eq(:string)
+		end
+
+		it "can set string field names" do
+			@conn2.field_name_type = :string
+			expect(@conn2.field_name_type).to eq(:string)
+			res = @conn2.exec("SELECT 1 as az")
+			expect(res.field_name_type).to eq(:string)
+			expect(res.fields).to eq(["az"])
+		end
+
+		it "can set symbol field names" do
+			@conn2.field_name_type = :symbol
+			expect(@conn2.field_name_type).to eq(:symbol)
+			res = @conn2.exec("SELECT 1 as az")
+			expect(res.field_name_type).to eq(:symbol)
+			expect(res.fields).to eq([:az])
+		end
+
+		it "can't set invalid values" do
+			expect{ @conn2.field_name_type = :sym }.to raise_error(ArgumentError, /invalid argument :sym/)
+			expect{ @conn2.field_name_type = "symbol" }.to raise_error(ArgumentError, /invalid argument "symbol"/)
+		end
+	end
+
+	describe "deprecated forms of methods" do
+		if PG::VERSION < "2"
+			it "should forward exec to exec_params" do
+				res = @conn.exec("VALUES($1::INT)", [7]).values
+				expect(res).to eq( [["7"]] )
+				res = @conn.exec("VALUES($1::INT)", [7], 1).values
+				expect(res).to eq( [[[7].pack("N")]] )
+				res = @conn.exec("VALUES(8)", [], 1).values
+				expect(res).to eq( [[[8].pack("N")]] )
+			end
+
+			it "should forward exec_params to exec" do
+				res = @conn.exec_params("VALUES(3); VALUES(4)").values
+				expect(res).to eq( [["4"]] )
+				res = @conn.exec_params("VALUES(3); VALUES(4)", nil).values
+				expect(res).to eq( [["4"]] )
+				res = @conn.exec_params("VALUES(3); VALUES(4)", nil, nil).values
+				expect(res).to eq( [["4"]] )
+				res = @conn.exec_params("VALUES(3); VALUES(4)", nil, 1).values
+				expect(res).to eq( [["4"]] )
+				res = @conn.exec_params("VALUES(3); VALUES(4)", nil, nil, nil).values
+				expect(res).to eq( [["4"]] )
+				expect{
+					@conn.exec_params("VALUES(3); VALUES(4)", nil, nil, nil, nil).values
+				}.to raise_error(ArgumentError)
+			end
+
+			it "should forward send_query to send_query_params" do
+				@conn.send_query("VALUES($1)", [5])
+				expect(@conn.get_last_result.values).to eq( [["5"]] )
+			end
+
+			it "should respond_to socket", :unix do
+				expect( @conn.socket ).to eq( @conn.socket_io.fileno )
+			end
+		else
+			# Method forwarding removed by PG::VERSION >= "2"
+			it "shouldn't forward exec to exec_params" do
+				expect do
+					@conn.exec("VALUES($1::INT)", [7])
+				end.to raise_error(ArgumentError)
+			end
+
+			it "shouldn't forward exec_params to exec" do
+				expect do
+					@conn.exec_params("VALUES(3); VALUES(4)")
+				end.to raise_error(ArgumentError)
+			end
+
+			it "shouldn't forward send_query to send_query_params" do
+				expect do
+					@conn.send_query("VALUES($1)", [5])
+				end.to raise_error(ArgumentError)
+			end
+
+			it "shouldn't forward async_exec_params to async_exec" do
+				expect do
+					@conn.async_exec_params("VALUES(1)")
+				end.to raise_error(ArgumentError)
+			end
+
+			it "shouldn't respond_to socket" do
+				expect do
+					@conn.socket
+				end.to raise_error(ArgumentError)
+			end
+		end
+
+		it "shouldn't forward send_query_params to send_query" do
+			expect{ @conn.send_query_params("VALUES(4)").values }
+				.to raise_error(ArgumentError)
+			expect{ @conn.send_query_params("VALUES(4)", nil).values }
+				.to raise_error(TypeError)
 		end
 	end
 end

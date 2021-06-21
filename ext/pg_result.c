@@ -6,12 +6,186 @@
 
 #include "pg.h"
 
-
 VALUE rb_cPGresult;
+static VALUE sym_symbol, sym_string, sym_static_symbol;
 
-static void pgresult_gc_free( PGresult * );
-static PGresult* pgresult_get( VALUE );
+static VALUE pgresult_type_map_set( VALUE, VALUE );
+static t_pg_result *pgresult_get_this( VALUE );
+static t_pg_result *pgresult_get_this_safe( VALUE );
 
+#if defined(HAVE_PQRESULTMEMORYSIZE)
+
+static ssize_t
+pgresult_approx_size(const PGresult *result)
+{
+	return PQresultMemorySize(result);
+}
+
+#else
+
+#define PGRESULT_DATA_BLOCKSIZE 2048
+typedef struct pgresAttValue
+{
+	int			len;			/* length in bytes of the value */
+	char	   *value;			/* actual value, plus terminating zero byte */
+} PGresAttValue;
+
+
+static int
+count_leading_zero_bits(unsigned int x)
+{
+#if defined(__GNUC__) || defined(__clang__)
+	return __builtin_clz(x);
+#elif defined(_MSC_VER)
+	DWORD r = 0;
+	_BitScanForward(&r, x);
+	return (int)r;
+#else
+	unsigned int a;
+	for(a=0; a < sizeof(unsigned int) * 8; a++){
+		if( x & (1 << (sizeof(unsigned int) * 8 - 1))) return a;
+		x <<= 1;
+	}
+	return a;
+#endif
+}
+
+static ssize_t
+pgresult_approx_size(const PGresult *result)
+{
+	int num_fields = PQnfields(result);
+	ssize_t size = 0;
+
+	if( num_fields > 0 ){
+		int num_tuples = PQntuples(result);
+
+		if( num_tuples > 0 ){
+			int pos;
+
+			/* This is a simple heuristic to determine the number of sample fields and subsequently to approximate the memory size taken by all field values of the result set.
+			 * Since scanning of all field values is would have a severe performance impact, only a small subset of fields is retrieved and the result is extrapolated to the whole result set.
+			 * The given algorithm has no real scientific background, but is made for speed and typical table layouts.
+			 */
+			int num_samples =
+				(num_fields < 9 ? num_fields : 39 - count_leading_zero_bits(num_fields-8)) *
+				(num_tuples < 8 ? 1 : 30 - count_leading_zero_bits(num_tuples));
+
+			/* start with scanning very last fields, since they are most probably in the cache */
+			for( pos = 0; pos < (num_samples+1)/2; pos++ ){
+				size += PQgetlength(result, num_tuples - 1 - (pos / num_fields), num_fields - 1 - (pos % num_fields));
+			}
+			/* scan the very first fields */
+			for( pos = 0; pos < num_samples/2; pos++ ){
+				size += PQgetlength(result, pos / num_fields, pos % num_fields);
+			}
+			/* extrapolate sample size to whole result set */
+			size = size * num_tuples * num_fields / num_samples;
+		}
+
+		/* count metadata */
+		size += num_fields * (
+				sizeof(PGresAttDesc) + /* column description */
+				num_tuples * (
+					sizeof(PGresAttValue) + 1 /* ptr, len and zero termination of each value */
+				)
+		);
+
+		/* Account free space due to libpq's default block size */
+		size = (size + PGRESULT_DATA_BLOCKSIZE - 1) / PGRESULT_DATA_BLOCKSIZE * PGRESULT_DATA_BLOCKSIZE;
+
+		/* count tuple pointers */
+		size += sizeof(void*) * ((num_tuples + 128 - 1) / 128 * 128);
+	}
+
+	size += 216; /* add PGresult size */
+
+	return size;
+}
+#endif
+
+/*
+ * GC Mark function
+ */
+static void
+pgresult_gc_mark( t_pg_result *this )
+{
+	int i;
+
+	rb_gc_mark_movable( this->connection );
+	rb_gc_mark_movable( this->typemap );
+	rb_gc_mark_movable( this->tuple_hash );
+	rb_gc_mark_movable( this->field_map );
+
+	for( i=0; i < this->nfields; i++ ){
+		rb_gc_mark_movable( this->fnames[i] );
+	}
+}
+
+static void
+pgresult_gc_compact( t_pg_result *this )
+{
+	int i;
+
+	pg_gc_location( this->connection );
+	pg_gc_location( this->typemap );
+	pg_gc_location( this->tuple_hash );
+	pg_gc_location( this->field_map );
+
+	for( i=0; i < this->nfields; i++ ){
+		pg_gc_location( this->fnames[i] );
+	}
+}
+
+/*
+ * GC Free function
+ */
+static void
+pgresult_clear( t_pg_result *this )
+{
+	if( this->pgresult && !this->autoclear ){
+		PQclear(this->pgresult);
+#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
+		rb_gc_adjust_memory_usage(-this->result_size);
+#endif
+	}
+	this->result_size = 0;
+	this->nfields = -1;
+	this->pgresult = NULL;
+}
+
+static void
+pgresult_gc_free( t_pg_result *this )
+{
+	pgresult_clear( this );
+	xfree(this);
+}
+
+static size_t
+pgresult_memsize( t_pg_result *this )
+{
+	/* Ideally the memory 'this' is pointing to should be taken into account as well.
+	 * However we don't want to store two memory sizes in t_pg_result just for reporting by ObjectSpace.memsize_of.
+	 */
+	return this->result_size;
+}
+
+static const rb_data_type_t pgresult_type = {
+	"PG::Result",
+	{
+		(void (*)(void*))pgresult_gc_mark,
+		(void (*)(void*))pgresult_gc_free,
+		(size_t (*)(const void *))pgresult_memsize,
+		pg_compact_callback(pgresult_gc_compact),
+	},
+	0, 0,
+	RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+/* Needed by sequel_pg gem, do not delete */
+int pg_get_result_enc_idx(VALUE self)
+{
+	return pgresult_get_this(self)->enc_idx;
+}
 
 /*
  * Global functions
@@ -20,19 +194,90 @@ static PGresult* pgresult_get( VALUE );
 /*
  * Result constructor
  */
+static VALUE
+pg_new_result2(PGresult *result, VALUE rb_pgconn)
+{
+	int nfields = result ? PQnfields(result) : 0;
+	VALUE self;
+	t_pg_result *this;
+
+	this = (t_pg_result *)xmalloc(sizeof(*this) +  sizeof(*this->fnames) * nfields);
+	this->pgresult = result;
+	this->connection = rb_pgconn;
+	this->typemap = pg_typemap_all_strings;
+	this->p_typemap = RTYPEDDATA_DATA( this->typemap );
+	this->nfields = -1;
+	this->tuple_hash = Qnil;
+	this->field_map = Qnil;
+	this->flags = 0;
+	self = TypedData_Wrap_Struct(rb_cPGresult, &pgresult_type, this);
+
+	if( result ){
+		t_pg_connection *p_conn = pg_get_connection(rb_pgconn);
+		VALUE typemap = p_conn->type_map_for_results;
+		/* Type check is done when assigned to PG::Connection. */
+		t_typemap *p_typemap = RTYPEDDATA_DATA(typemap);
+
+		this->enc_idx = p_conn->enc_idx;
+		this->typemap = p_typemap->funcs.fit_to_result( typemap, self );
+		this->p_typemap = RTYPEDDATA_DATA( this->typemap );
+		this->flags = p_conn->flags;
+	} else {
+		this->enc_idx = rb_locale_encindex();
+	}
+
+	return self;
+}
+
 VALUE
 pg_new_result(PGresult *result, VALUE rb_pgconn)
 {
-	PGconn *conn = pg_get_pgconn( rb_pgconn );
-	VALUE val = Data_Wrap_Struct(rb_cPGresult, NULL, pgresult_gc_free, result);
-#ifdef M17N_SUPPORTED
-	rb_encoding *enc = pg_conn_enc_get( conn );
-	ENCODING_SET( val, rb_enc_to_index(enc) );
+	VALUE self = pg_new_result2(result, rb_pgconn);
+	t_pg_result *this = pgresult_get_this(self);
+
+	this->autoclear = 0;
+
+	/* Estimate size of underlying pgresult memory storage and account to ruby GC.
+	 * There's no need to adjust the GC for xmalloc'ed memory, but libpq is using libc malloc() ruby doesn't know about.
+	 */
+	/* TODO: If someday most systems provide PQresultMemorySize(), it's questionable to store result_size in t_pg_result in addition to the value already stored in PGresult.
+	 * For now the memory savings don't justify the ifdefs necessary to support both cases.
+	 */
+	this->result_size = pgresult_approx_size(result);
+
+#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
+	rb_gc_adjust_memory_usage(this->result_size);
 #endif
 
-	rb_iv_set( val, "@connection", rb_pgconn );
+	return self;
+}
 
-	return val;
+static VALUE
+pg_copy_result(t_pg_result *this)
+{
+	int nfields = this->nfields == -1 ? (this->pgresult ? PQnfields(this->pgresult) : 0) : this->nfields;
+	size_t len = sizeof(*this) +  sizeof(*this->fnames) * nfields;
+	t_pg_result *copy;
+
+	copy = (t_pg_result *)xmalloc(len);
+	memcpy(copy, this, len);
+	this->result_size = 0;
+
+	return TypedData_Wrap_Struct(rb_cPGresult, &pgresult_type, copy);
+}
+
+VALUE
+pg_new_result_autoclear(PGresult *result, VALUE rb_pgconn)
+{
+	VALUE self = pg_new_result2(result, rb_pgconn);
+	t_pg_result *this = pgresult_get_this(self);
+
+	/* Autocleared results are freed implicit instead of by PQclear().
+	 * So it's not very useful to be accounted by ruby GC.
+	 */
+	this->result_size = 0;
+	this->autoclear = 1;
+	return self;
 }
 
 /*
@@ -44,56 +289,48 @@ pg_new_result(PGresult *result, VALUE rb_pgconn)
 VALUE
 pg_result_check( VALUE self )
 {
-	VALUE error, exception;
-	VALUE rb_pgconn = rb_iv_get( self, "@connection" );
-	PGconn *conn = pg_get_pgconn(rb_pgconn);
-	PGresult *result;
-#ifdef M17N_SUPPORTED
-	rb_encoding *enc = pg_conn_enc_get( conn );
-#endif
+	t_pg_result *this = pgresult_get_this(self);
+	VALUE error, exception, klass;
+	char * sqlstate;
 
-	Data_Get_Struct(self, PGresult, result);
-
-	if(result == NULL)
+	if(this->pgresult == NULL)
 	{
+		PGconn *conn = pg_get_pgconn(this->connection);
 		error = rb_str_new2( PQerrorMessage(conn) );
 	}
 	else
 	{
-		switch (PQresultStatus(result))
+		switch (PQresultStatus(this->pgresult))
 		{
 		case PGRES_TUPLES_OK:
 		case PGRES_COPY_OUT:
 		case PGRES_COPY_IN:
-#ifdef HAVE_CONST_PGRES_COPY_BOTH
 		case PGRES_COPY_BOTH:
-#endif
-#ifdef HAVE_CONST_PGRES_SINGLE_TUPLE
 		case PGRES_SINGLE_TUPLE:
-#endif
 		case PGRES_EMPTY_QUERY:
 		case PGRES_COMMAND_OK:
-			return Qnil;
+			return self;
 		case PGRES_BAD_RESPONSE:
 		case PGRES_FATAL_ERROR:
 		case PGRES_NONFATAL_ERROR:
-			error = rb_str_new2( PQresultErrorMessage(result) );
+			error = rb_str_new2( PQresultErrorMessage(this->pgresult) );
 			break;
 		default:
 			error = rb_str_new2( "internal error : unknown result status." );
 		}
 	}
 
-#ifdef M17N_SUPPORTED
-	rb_enc_set_index( error, rb_enc_to_index(enc) );
-#endif
-	exception = rb_exc_new3( rb_ePGerror, error );
-	rb_iv_set( exception, "@connection", rb_pgconn );
-	rb_iv_set( exception, "@result", self );
+	PG_ENCODING_SET_NOCHECK( error, this->enc_idx );
+
+	sqlstate = PQresultErrorField( this->pgresult, PG_DIAG_SQLSTATE );
+	klass = lookup_error_class( sqlstate );
+	exception = rb_exc_new3( klass, error );
+	rb_iv_set( exception, "@connection", this->connection );
+	rb_iv_set( exception, "@result", this->pgresult ? self : Qnil );
 	rb_exc_raise( exception );
 
 	/* Not reached */
-	return Qnil;
+	return self;
 }
 
 
@@ -107,62 +344,151 @@ pg_result_check( VALUE self )
  * call-seq:
  *    res.clear() -> nil
  *
- * Clears the PG::Result object as the result of the query.
+ * Clears the PG::Result object as the result of a query.
+ * This frees all underlying memory consumed by the result object.
+ * Afterwards access to result methods raises PG::Error "result has been cleared".
+ *
+ * Explicit calling #clear can lead to better memory performance, but is not generally necessary.
+ * Special care must be taken when PG::Tuple objects are used.
+ * In this case #clear must not be called unless all PG::Tuple objects of this result are fully materialized.
+ *
+ * If PG::Result#autoclear? is +true+ then the result is only marked as cleared but clearing the underlying C struct will happen when the callback returns.
+ *
  */
 VALUE
 pg_result_clear(VALUE self)
 {
-	PQclear(pgresult_get(self));
-	DATA_PTR(self) = NULL;
+	t_pg_result *this = pgresult_get_this(self);
+	pgresult_clear( this );
 	return Qnil;
 }
 
+/*
+ * call-seq:
+ *    res.cleared?      -> boolean
+ *
+ * Returns +true+ if the backend result memory has been free'd.
+ */
+VALUE
+pgresult_cleared_p( VALUE self )
+{
+	t_pg_result *this = pgresult_get_this(self);
+	return this->pgresult ? Qfalse : Qtrue;
+}
 
+/*
+ * call-seq:
+ *    res.autoclear?      -> boolean
+ *
+ * Returns +true+ if the underlying C struct will be cleared at the end of a callback.
+ * This applies only to Result objects received by the block to PG::Cinnection#set_notice_receiver .
+ *
+ * All other Result objects are automatically cleared by the GC when the object is no longer in use or manually by PG::Result#clear .
+ *
+ */
+VALUE
+pgresult_autoclear_p( VALUE self )
+{
+	t_pg_result *this = pgresult_get_this(self);
+	return this->autoclear ? Qtrue : Qfalse;
+}
 
 /*
  * DATA pointer functions
  */
 
 /*
- * GC Free function
+ * Fetch the PG::Result object data pointer and check it's
+ * PGresult data pointer for sanity.
  */
-static void
-pgresult_gc_free( PGresult *result )
+static t_pg_result *
+pgresult_get_this_safe( VALUE self )
 {
-	if(result != NULL)
-		PQclear(result);
+	t_pg_result *this = pgresult_get_this(self);
+
+	if (this->pgresult == NULL) rb_raise(rb_ePGerror, "result has been cleared");
+	return this;
 }
 
 /*
- * Fetch the data pointer for the result object
+ * Fetch the PGresult pointer for the result object and check validity
+ *
+ * Note: This function is used externally by the sequel_pg gem,
+ * so do changes carefully.
+ *
  */
-static PGresult*
+PGresult*
 pgresult_get(VALUE self)
 {
-	PGresult *result;
-	Data_Get_Struct(self, PGresult, result);
-	if (result == NULL) rb_raise(rb_ePGerror, "result has been cleared");
-	return result;
+	t_pg_result *this = pgresult_get_this(self);
+
+	if (this->pgresult == NULL) rb_raise(rb_ePGerror, "result has been cleared");
+	return this->pgresult;
 }
 
+static VALUE pg_cstr_to_sym(char *cstr, unsigned int flags, int enc_idx)
+{
+	VALUE fname;
+#ifdef TRUFFLERUBY
+	if( flags & (PG_RESULT_FIELD_NAMES_SYMBOL | PG_RESULT_FIELD_NAMES_STATIC_SYMBOL) ){
+#else
+	if( flags & PG_RESULT_FIELD_NAMES_SYMBOL ){
+		rb_encoding *enc = rb_enc_from_index(enc_idx);
+		fname = rb_check_symbol_cstr(cstr, strlen(cstr), enc);
+		if( fname == Qnil ){
+			fname = rb_str_new2(cstr);
+			PG_ENCODING_SET_NOCHECK(fname, enc_idx);
+			fname = rb_str_intern(fname);
+		}
+	} else if( flags & PG_RESULT_FIELD_NAMES_STATIC_SYMBOL ){
+#endif
+		rb_encoding *enc = rb_enc_from_index(enc_idx);
+		fname = ID2SYM(rb_intern3(cstr, strlen(cstr), enc));
+	} else {
+		fname = rb_str_new2(cstr);
+		PG_ENCODING_SET_NOCHECK(fname, enc_idx);
+		fname = rb_obj_freeze(fname);
+	}
+	return fname;
+}
+
+static void pgresult_init_fnames(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this_safe(self);
+
+	if( this->nfields == -1 ){
+		int i;
+		int nfields = PQnfields(this->pgresult);
+
+		for( i=0; i<nfields; i++ ){
+			char *cfname = PQfname(this->pgresult, i);
+			this->fnames[i] = pg_cstr_to_sym(cfname, this->flags, this->enc_idx);
+			this->nfields = i + 1;
+		}
+		this->nfields = nfields;
+	}
+}
 
 /********************************************************************
- * 
+ *
  * Document-class: PG::Result
  *
- * The class to represent the query result tuples (rows). 
+ * The class to represent the query result tuples (rows).
  * An instance of this class is created as the result of every query.
- * You may need to invoke the #clear method of the instance when finished with
- * the result for better memory performance.
+ * All result rows and columns are stored in a memory block attached to the PG::Result object.
+ * Whenever a value is accessed it is casted to a Ruby object by the assigned #type_map .
+ *
+ * Since pg-1.1 the amount of memory in use by a PG::Result object is estimated and passed to ruby's garbage collector.
+ * You can invoke the #clear method to force deallocation of memory of the instance when finished with the result for better memory performance.
  *
  * Example:
  *    require 'pg'
- *    conn = PGconn.open(:dbname => 'test')
+ *    conn = PG.connect(:dbname => 'test')
  *    res  = conn.exec('SELECT 1 AS a, 2 AS b, NULL AS c')
  *    res.getvalue(0,0) # '1'
  *    res[0]['b']       # '2'
  *    res[0]['c']       # nil
- *  
+ *
  */
 
 /**************************************************************************
@@ -171,7 +497,7 @@ pgresult_get(VALUE self)
 
 /*
  * call-seq:
- *    res.result_status() -> Fixnum
+ *    res.result_status() -> Integer
  *
  * Returns the status of the query. The status value is one of:
  * * +PGRES_EMPTY_QUERY+
@@ -200,8 +526,9 @@ pgresult_result_status(VALUE self)
 static VALUE
 pgresult_res_status(VALUE self, VALUE status)
 {
-	VALUE ret = rb_tainted_str_new2(PQresStatus(NUM2INT(status)));
-	ASSOCIATE_INDEX(ret, self);
+	t_pg_result *this = pgresult_get_this_safe(self);
+	VALUE ret = rb_str_new2(PQresStatus(NUM2INT(status)));
+	PG_ENCODING_SET_NOCHECK(ret, this->enc_idx);
 	return ret;
 }
 
@@ -209,15 +536,44 @@ pgresult_res_status(VALUE self, VALUE status)
  * call-seq:
  *    res.error_message() -> String
  *
- * Returns the error message of the command as a string. 
+ * Returns the error message of the command as a string.
  */
 static VALUE
 pgresult_error_message(VALUE self)
 {
-	VALUE ret = rb_tainted_str_new2(PQresultErrorMessage(pgresult_get(self)));
-	ASSOCIATE_INDEX(ret, self);
+	t_pg_result *this = pgresult_get_this_safe(self);
+	VALUE ret = rb_str_new2(PQresultErrorMessage(this->pgresult));
+	PG_ENCODING_SET_NOCHECK(ret, this->enc_idx);
 	return ret;
 }
+
+#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
+/*
+ * call-seq:
+ *    res.verbose_error_message( verbosity, show_context ) -> String
+ *
+ * Returns a reformatted version of the error message associated with a PGresult object.
+ *
+ * Available since PostgreSQL-9.6
+ */
+static VALUE
+pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
+{
+	t_pg_result *this = pgresult_get_this_safe(self);
+	VALUE ret;
+	char *c_str;
+
+	c_str = PQresultVerboseErrorMessage(this->pgresult, NUM2INT(verbosity), NUM2INT(show_context));
+	if(!c_str)
+		rb_raise(rb_eNoMemError, "insufficient memory to format error message");
+
+	ret = rb_str_new2(c_str);
+	PQfreemem(c_str);
+	PG_ENCODING_SET_NOCHECK(ret, this->enc_idx);
+
+	return ret;
+}
+#endif
 
 /*
  * call-seq:
@@ -240,42 +596,42 @@ pgresult_error_message(VALUE self)
  * * +PG_DIAG_SOURCE_FUNCTION+
  *
  * An example:
- * 
+ *
  *   begin
  *       conn.exec( "SELECT * FROM nonexistant_table" )
  *   rescue PG::Error => err
  *       p [
- *           result.error_field( PG::Result::PG_DIAG_SEVERITY ),
- *           result.error_field( PG::Result::PG_DIAG_SQLSTATE ),
- *           result.error_field( PG::Result::PG_DIAG_MESSAGE_PRIMARY ),
- *           result.error_field( PG::Result::PG_DIAG_MESSAGE_DETAIL ),
- *           result.error_field( PG::Result::PG_DIAG_MESSAGE_HINT ),
- *           result.error_field( PG::Result::PG_DIAG_STATEMENT_POSITION ),
- *           result.error_field( PG::Result::PG_DIAG_INTERNAL_POSITION ),
- *           result.error_field( PG::Result::PG_DIAG_INTERNAL_QUERY ),
- *           result.error_field( PG::Result::PG_DIAG_CONTEXT ),
- *           result.error_field( PG::Result::PG_DIAG_SOURCE_FILE ),
- *           result.error_field( PG::Result::PG_DIAG_SOURCE_LINE ),
- *           result.error_field( PG::Result::PG_DIAG_SOURCE_FUNCTION ),
+ *           err.result.error_field( PG::Result::PG_DIAG_SEVERITY ),
+ *           err.result.error_field( PG::Result::PG_DIAG_SQLSTATE ),
+ *           err.result.error_field( PG::Result::PG_DIAG_MESSAGE_PRIMARY ),
+ *           err.result.error_field( PG::Result::PG_DIAG_MESSAGE_DETAIL ),
+ *           err.result.error_field( PG::Result::PG_DIAG_MESSAGE_HINT ),
+ *           err.result.error_field( PG::Result::PG_DIAG_STATEMENT_POSITION ),
+ *           err.result.error_field( PG::Result::PG_DIAG_INTERNAL_POSITION ),
+ *           err.result.error_field( PG::Result::PG_DIAG_INTERNAL_QUERY ),
+ *           err.result.error_field( PG::Result::PG_DIAG_CONTEXT ),
+ *           err.result.error_field( PG::Result::PG_DIAG_SOURCE_FILE ),
+ *           err.result.error_field( PG::Result::PG_DIAG_SOURCE_LINE ),
+ *           err.result.error_field( PG::Result::PG_DIAG_SOURCE_FUNCTION ),
  *       ]
  *   end
- * 
+ *
  * Outputs:
- * 
- *   ["ERROR", "42P01", "relation \"nonexistant_table\" does not exist", nil, nil, 
+ *
+ *   ["ERROR", "42P01", "relation \"nonexistant_table\" does not exist", nil, nil,
  *    "15", nil, nil, nil, "path/to/parse_relation.c", "857", "parserOpenTable"]
  */
 static VALUE
 pgresult_error_field(VALUE self, VALUE field)
 {
-	PGresult *result = pgresult_get( self );
+	t_pg_result *this = pgresult_get_this_safe(self);
 	int fieldcode = NUM2INT( field );
-	char * fieldstr = PQresultErrorField( result, fieldcode );
+	char * fieldstr = PQresultErrorField( this->pgresult, fieldcode );
 	VALUE ret = Qnil;
 
 	if ( fieldstr ) {
-		ret = rb_tainted_str_new2( fieldstr );
-		ASSOCIATE_INDEX( ret, self );
+		ret = rb_str_new2( fieldstr );
+		PG_ENCODING_SET_NOCHECK( ret, this->enc_idx );
 	}
 
 	return ret;
@@ -283,7 +639,7 @@ pgresult_error_field(VALUE self, VALUE field)
 
 /*
  * call-seq:
- *    res.ntuples() -> Fixnum
+ *    res.ntuples() -> Integer
  *
  * Returns the number of tuples in the query result.
  */
@@ -293,9 +649,15 @@ pgresult_ntuples(VALUE self)
 	return INT2FIX(PQntuples(pgresult_get(self)));
 }
 
+static VALUE
+pgresult_ntuples_for_enum(VALUE self, VALUE args, VALUE eobj)
+{
+	return pgresult_ntuples(self);
+}
+
 /*
  * call-seq:
- *    res.nfields() -> Fixnum
+ *    res.nfields() -> Integer
  *
  * Returns the number of columns in the query result.
  */
@@ -307,29 +669,30 @@ pgresult_nfields(VALUE self)
 
 /*
  * call-seq:
- *    res.fname( index ) -> String
+ *    res.fname( index ) -> String or Symbol
  *
  * Returns the name of the column corresponding to _index_.
+ * Depending on #field_name_type= it's a String or Symbol.
+ *
  */
 static VALUE
 pgresult_fname(VALUE self, VALUE index)
 {
-	VALUE fname;
-	PGresult *result;
+	t_pg_result *this = pgresult_get_this_safe(self);
 	int i = NUM2INT(index);
+	char *cfname;
 
-	result = pgresult_get(self);
-	if (i < 0 || i >= PQnfields(result)) {
+	if (i < 0 || i >= PQnfields(this->pgresult)) {
 		rb_raise(rb_eArgError,"invalid field number %d", i);
 	}
-	fname = rb_tainted_str_new2(PQfname(result, i));
-	ASSOCIATE_INDEX(fname, self);
-	return fname;
+
+	cfname = PQfname(this->pgresult, i);
+	return pg_cstr_to_sym(cfname, this->flags, this->enc_idx);
 }
 
 /*
  * call-seq:
- *    res.fnumber( name ) -> Fixnum
+ *    res.fnumber( name ) -> Integer
  *
  * Returns the index of the field specified by the string +name+.
  * The given +name+ is treated like an identifier in an SQL command, that is,
@@ -357,16 +720,16 @@ pgresult_fnumber(VALUE self, VALUE name)
 
 	Check_Type(name, T_STRING);
 
-	n = PQfnumber(pgresult_get(self), StringValuePtr(name));
+	n = PQfnumber(pgresult_get(self), StringValueCStr(name));
 	if (n == -1) {
-		rb_raise(rb_eArgError,"Unknown field: %s", StringValuePtr(name));
+		rb_raise(rb_eArgError,"Unknown field: %s", StringValueCStr(name));
 	}
 	return INT2FIX(n);
 }
 
 /*
  * call-seq:
- *    res.ftable( column_number ) -> Fixnum
+ *    res.ftable( column_number ) -> Integer
  *
  * Returns the Oid of the table from which the column _column_number_
  * was fetched.
@@ -381,18 +744,18 @@ pgresult_ftable(VALUE self, VALUE column_number)
 	int col_number = NUM2INT(column_number);
 	PGresult *pgresult = pgresult_get(self);
 
-	if( col_number < 0 || col_number >= PQnfields(pgresult)) 
+	if( col_number < 0 || col_number >= PQnfields(pgresult))
 		rb_raise(rb_eArgError,"Invalid column index: %d", col_number);
 
 	n = PQftable(pgresult, col_number);
-	return INT2FIX(n);
+	return UINT2NUM(n);
 }
 
 /*
  * call-seq:
- *    res.ftablecol( column_number ) -> Fixnum
+ *    res.ftablecol( column_number ) -> Integer
  *
- * Returns the column number (within its table) of the table from 
+ * Returns the column number (within its table) of the table from
  * which the column _column_number_ is made up.
  *
  * Raises ArgumentError if _column_number_ is out of range or if
@@ -406,7 +769,7 @@ pgresult_ftablecol(VALUE self, VALUE column_number)
 
 	int n;
 
-	if( col_number < 0 || col_number >= PQnfields(pgresult)) 
+	if( col_number < 0 || col_number >= PQnfields(pgresult))
 		rb_raise(rb_eArgError,"Invalid column index: %d", col_number);
 
 	n = PQftablecol(pgresult, col_number);
@@ -415,11 +778,11 @@ pgresult_ftablecol(VALUE self, VALUE column_number)
 
 /*
  * call-seq:
- *    res.fformat( column_number ) -> Fixnum
+ *    res.fformat( column_number ) -> Integer
  *
  * Returns the format (0 for text, 1 for binary) of column
  * _column_number_.
- * 
+ *
  * Raises ArgumentError if _column_number_ is out of range.
  */
 static VALUE
@@ -428,7 +791,7 @@ pgresult_fformat(VALUE self, VALUE column_number)
 	PGresult *result = pgresult_get(self);
 	int fnumber = NUM2INT(column_number);
 	if (fnumber < 0 || fnumber >= PQnfields(result)) {
-		rb_raise(rb_eArgError, "Column number is out of range: %d", 
+		rb_raise(rb_eArgError, "Column number is out of range: %d",
 			fnumber);
 	}
 	return INT2FIX(PQfformat(result, fnumber));
@@ -436,20 +799,20 @@ pgresult_fformat(VALUE self, VALUE column_number)
 
 /*
  * call-seq:
- *    res.ftype( column_number )
+ *    res.ftype( column_number )  -> Integer
  *
  * Returns the data type associated with _column_number_.
  *
  * The integer returned is the internal +OID+ number (in PostgreSQL)
  * of the type. To get a human-readable value for the type, use the
- * returned OID and the field's #fmod value with the format_type() SQL 
+ * returned OID and the field's #fmod value with the format_type() SQL
  * function:
- * 
+ *
  *   # Get the type of the second column of the result 'res'
  *   typename = conn.
  *     exec( "SELECT format_type($1,$2)", [res.ftype(1), res.fmod(1)] ).
  *     getvalue( 0, 0 )
- * 
+ *
  * Raises an ArgumentError if _column_number_ is out of range.
  */
 static VALUE
@@ -460,16 +823,16 @@ pgresult_ftype(VALUE self, VALUE index)
 	if (i < 0 || i >= PQnfields(result)) {
 		rb_raise(rb_eArgError, "invalid field number %d", i);
 	}
-	return INT2NUM(PQftype(result, i));
+	return UINT2NUM(PQftype(result, i));
 }
 
 /*
  * call-seq:
  *    res.fmod( column_number )
  *
- * Returns the type modifier associated with column _column_number_. See 
+ * Returns the type modifier associated with column _column_number_. See
  * the #ftype method for an example of how to use this.
- * 
+ *
  * Raises an ArgumentError if _column_number_ is out of range.
  */
 static VALUE
@@ -479,7 +842,7 @@ pgresult_fmod(VALUE self, VALUE column_number)
 	int fnumber = NUM2INT(column_number);
 	int modifier;
 	if (fnumber < 0 || fnumber >= PQnfields(result)) {
-		rb_raise(rb_eArgError, "Column number is out of range: %d", 
+		rb_raise(rb_eArgError, "Column number is out of range: %d",
 			fnumber);
 	}
 	modifier = PQfmod(result,fnumber);
@@ -510,6 +873,7 @@ pgresult_fsize(VALUE self, VALUE index)
 	return INT2NUM(PQfsize(result, i));
 }
 
+
 /*
  * call-seq:
  *    res.getvalue( tup_num, field_num )
@@ -520,33 +884,17 @@ pgresult_fsize(VALUE self, VALUE index)
 static VALUE
 pgresult_getvalue(VALUE self, VALUE tup_num, VALUE field_num)
 {
-	VALUE val;
-	PGresult *result;
+	t_pg_result *this = pgresult_get_this_safe(self);
 	int i = NUM2INT(tup_num);
 	int j = NUM2INT(field_num);
 
-	result = pgresult_get(self);
-	if(i < 0 || i >= PQntuples(result)) {
+	if(i < 0 || i >= PQntuples(this->pgresult)) {
 		rb_raise(rb_eArgError,"invalid tuple number %d", i);
 	}
-	if(j < 0 || j >= PQnfields(result)) {
+	if(j < 0 || j >= PQnfields(this->pgresult)) {
 		rb_raise(rb_eArgError,"invalid field number %d", j);
 	}
-	if(PQgetisnull(result, i, j))
-		return Qnil;
-	val = rb_tainted_str_new(PQgetvalue(result, i, j),
-				PQgetlength(result, i, j));
-
-#ifdef M17N_SUPPORTED
-	/* associate client encoding for text format only */
-	if ( 0 == PQfformat(result, j) ) {
-		ASSOCIATE_INDEX( val, self );
-	} else {
-		rb_enc_associate( val, rb_ascii8bit_encoding() );
-	}
-#endif
-
-	return val;
+	return this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, i, j);
 }
 
 /*
@@ -574,7 +922,7 @@ pgresult_getisnull(VALUE self, VALUE tup_num, VALUE field_num)
 
 /*
  * call-seq:
- *    res.getlength( tup_num, field_num ) -> Fixnum
+ *    res.getlength( tup_num, field_num ) -> Integer
  *
  * Returns the (String) length of the field in bytes.
  *
@@ -599,7 +947,7 @@ pgresult_getlength(VALUE self, VALUE tup_num, VALUE field_num)
 
 /*
  * call-seq:
- *    res.nparams() -> Fixnum
+ *    res.nparams() -> Integer
  *
  * Returns the number of parameters of a prepared statement.
  * Only useful for the result returned by conn.describePrepared
@@ -626,7 +974,7 @@ pgresult_paramtype(VALUE self, VALUE param_number)
 	PGresult *result;
 
 	result = pgresult_get(self);
-	return INT2FIX(PQparamtype(result,NUM2INT(param_number)));
+	return UINT2NUM(PQparamtype(result,NUM2INT(param_number)));
 }
 
 /*
@@ -638,23 +986,30 @@ pgresult_paramtype(VALUE self, VALUE param_number)
 static VALUE
 pgresult_cmd_status(VALUE self)
 {
-	VALUE ret = rb_tainted_str_new2(PQcmdStatus(pgresult_get(self)));
-	ASSOCIATE_INDEX(ret, self);
+	t_pg_result *this = pgresult_get_this_safe(self);
+	VALUE ret = rb_str_new2(PQcmdStatus(this->pgresult));
+	PG_ENCODING_SET_NOCHECK(ret, this->enc_idx);
 	return ret;
 }
 
 /*
  * call-seq:
- *    res.cmd_tuples() -> Fixnum
+ *    res.cmd_tuples() -> Integer
  *
  * Returns the number of tuples (rows) affected by the SQL command.
  *
  * If the SQL command that generated the PG::Result was not one of:
- * * +INSERT+
- * * +UPDATE+
- * * +DELETE+
- * * +MOVE+
- * * +FETCH+
+ *
+ * * <tt>SELECT</tt>
+ * * <tt>CREATE TABLE AS</tt>
+ * * <tt>INSERT</tt>
+ * * <tt>UPDATE</tt>
+ * * <tt>DELETE</tt>
+ * * <tt>MOVE</tt>
+ * * <tt>FETCH</tt>
+ * * <tt>COPY</tt>
+ * * an +EXECUTE+ of a prepared query that contains an +INSERT+, +UPDATE+, or +DELETE+ statement
+ *
  * or if no tuples were affected, <tt>0</tt> is returned.
  */
 static VALUE
@@ -662,12 +1017,12 @@ pgresult_cmd_tuples(VALUE self)
 {
 	long n;
 	n = strtol(PQcmdTuples(pgresult_get(self)),NULL, 10);
-	return INT2NUM(n);
+	return LONG2NUM(n);
 }
 
 /*
  * call-seq:
- *    res.oid_value() -> Fixnum
+ *    res.oid_value() -> Integer
  *
  * Returns the +oid+ of the inserted row if applicable,
  * otherwise +nil+.
@@ -679,7 +1034,7 @@ pgresult_oid_value(VALUE self)
 	if (n == InvalidOid)
 		return Qnil;
 	else
-		return INT2FIX(n);
+		return UINT2NUM(n);
 }
 
 /* Utility methods not in libpq */
@@ -688,43 +1043,34 @@ pgresult_oid_value(VALUE self)
  * call-seq:
  *    res[ n ] -> Hash
  *
- * Returns tuple _n_ as a hash. 
+ * Returns tuple _n_ as a hash.
  */
 static VALUE
 pgresult_aref(VALUE self, VALUE index)
 {
-	PGresult *result = pgresult_get(self);
+	t_pg_result *this = pgresult_get_this_safe(self);
 	int tuple_num = NUM2INT(index);
 	int field_num;
-	VALUE fname,val;
+	int num_tuples = PQntuples(this->pgresult);
 	VALUE tuple;
 
-	if ( tuple_num < 0 || tuple_num >= PQntuples(result) )
+	if( this->nfields == -1 )
+		pgresult_init_fnames( self );
+
+	if ( tuple_num < 0 || tuple_num >= num_tuples )
 		rb_raise( rb_eIndexError, "Index %d is out of range", tuple_num );
 
-	tuple = rb_hash_new();
-	for ( field_num = 0; field_num < PQnfields(result); field_num++ ) {
-		fname = rb_tainted_str_new2( PQfname(result,field_num) );
-		ASSOCIATE_INDEX(fname, self);
-		if ( PQgetisnull(result, tuple_num, field_num) ) {
-			rb_hash_aset( tuple, fname, Qnil );
-		}
-		else {
-			val = rb_tainted_str_new( PQgetvalue(result, tuple_num, field_num ),
-			                          PQgetlength(result, tuple_num, field_num) );
-
-#ifdef M17N_SUPPORTED
-			/* associate client encoding for text format only */
-			if ( 0 == PQfformat(result, field_num) ) {
-				ASSOCIATE_INDEX( val, self );
-			} else {
-				rb_enc_associate( val, rb_ascii8bit_encoding() );
-			}
-#endif
-
-			rb_hash_aset( tuple, fname, val );
-		}
+	/* We reuse the Hash of the previous output for larger row counts.
+	 * This is somewhat faster than populating an empty Hash object. */
+	tuple = NIL_P(this->tuple_hash) ? rb_hash_new() : this->tuple_hash;
+	for ( field_num = 0; field_num < this->nfields; field_num++ ) {
+		VALUE val = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, tuple_num, field_num);
+		rb_hash_aset( tuple, this->fnames[field_num], val );
 	}
+	/* Store a copy of the filled hash for use at the next row. */
+	if( num_tuples > 10 )
+		this->tuple_hash = rb_hash_dup(tuple);
+
 	return tuple;
 }
 
@@ -737,41 +1083,59 @@ pgresult_aref(VALUE self, VALUE index)
 static VALUE
 pgresult_each_row(VALUE self)
 {
-	PGresult* result = (PGresult*) pgresult_get(self);
+	t_pg_result *this;
 	int row;
 	int field;
-	int num_rows = PQntuples(result);
-	int num_fields = PQnfields(result);
+	int num_rows;
+	int num_fields;
+
+	RETURN_SIZED_ENUMERATOR(self, 0, NULL, pgresult_ntuples_for_enum);
+
+	this = pgresult_get_this_safe(self);
+	num_rows = PQntuples(this->pgresult);
+	num_fields = PQnfields(this->pgresult);
 
 	for ( row = 0; row < num_rows; row++ ) {
-		VALUE new_row = rb_ary_new2(num_fields);
+		PG_VARIABLE_LENGTH_ARRAY(VALUE, row_values, num_fields, PG_MAX_COLUMNS)
 
 		/* populate the row */
 		for ( field = 0; field < num_fields; field++ ) {
-			if ( PQgetisnull(result, row, field) ) {
-				rb_ary_store( new_row, field, Qnil );
-			}
-			else {
-				VALUE val = rb_tainted_str_new( PQgetvalue(result, row, field), 
-				                                PQgetlength(result, row, field) );
-
-#ifdef M17N_SUPPORTED
-				/* associate client encoding for text format only */
-				if ( 0 == PQfformat(result, field) ) {
-					ASSOCIATE_INDEX( val, self );
-				} else {
-					rb_enc_associate( val, rb_ascii8bit_encoding() );
-				}
-#endif
-				rb_ary_store( new_row, field, val );
-			}
+			row_values[field] = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, row, field);
 		}
-		rb_yield( new_row );
+		rb_yield( rb_ary_new4( num_fields, row_values ));
 	}
 
 	return Qnil;
 }
 
+/*
+ * call-seq:
+ *    res.values -> Array
+ *
+ * Returns all tuples as an array of arrays.
+ */
+static VALUE
+pgresult_values(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this_safe(self);
+	int row;
+	int field;
+	int num_rows = PQntuples(this->pgresult);
+	int num_fields = PQnfields(this->pgresult);
+	VALUE results = rb_ary_new2( num_rows );
+
+	for ( row = 0; row < num_rows; row++ ) {
+		PG_VARIABLE_LENGTH_ARRAY(VALUE, row_values, num_fields, PG_MAX_COLUMNS)
+
+		/* populate the row */
+		for ( field = 0; field < num_fields; field++ ) {
+			row_values[field] = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, row, field);
+		}
+		rb_ary_store( results, row, rb_ary_new4( num_fields, row_values ) );
+	}
+
+	return results;
+}
 
 /*
  * Make a Ruby array out of the encoded values from the specified
@@ -780,28 +1144,16 @@ pgresult_each_row(VALUE self)
 static VALUE
 make_column_result_array( VALUE self, int col )
 {
-	PGresult *result = pgresult_get( self );
-	int rows = PQntuples( result );
+	t_pg_result *this = pgresult_get_this_safe(self);
+	int rows = PQntuples( this->pgresult );
 	int i;
-	VALUE val = Qnil;
 	VALUE results = rb_ary_new2( rows );
 
-	if ( col >= PQnfields(result) )
+	if ( col >= PQnfields(this->pgresult) )
 		rb_raise( rb_eIndexError, "no column %d in result", col );
 
 	for ( i=0; i < rows; i++ ) {
-		val = rb_tainted_str_new( PQgetvalue(result, i, col),
-		                          PQgetlength(result, i, col) );
-
-#ifdef M17N_SUPPORTED
-		/* associate client encoding for text format only */
-		if ( 0 == PQfformat(result, col) ) { 
-			ASSOCIATE_INDEX( val, self );
-		} else {
-			rb_enc_associate( val, rb_ascii8bit_encoding() );
-		}
-#endif
-
+		VALUE val = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, i, col);
 		rb_ary_store( results, i, val );
 	}
 
@@ -813,7 +1165,7 @@ make_column_result_array( VALUE self, int col )
  *  call-seq:
  *     res.column_values( n )   -> array
  *
- *  Returns an Array of the values from the nth column of each 
+ *  Returns an Array of the values from the nth column of each
  *  tuple in the result.
  *
  */
@@ -836,13 +1188,96 @@ static VALUE
 pgresult_field_values( VALUE self, VALUE field )
 {
 	PGresult *result = pgresult_get( self );
-	const char *fieldname = StringValuePtr( field );
-	int fnum = PQfnumber( result, fieldname );
+	const char *fieldname;
+	int fnum;
+
+	if( RB_TYPE_P(field, T_SYMBOL) ) field = rb_sym_to_s( field );
+	fieldname = StringValueCStr( field );
+	fnum = PQfnumber( result, fieldname );
 
 	if ( fnum < 0 )
 		rb_raise( rb_eIndexError, "no such field '%s' in result", fieldname );
 
 	return make_column_result_array( self, fnum );
+}
+
+
+/*
+ *  call-seq:
+ *     res.tuple_values( n )   -> array
+ *
+ *  Returns an Array of the field values from the nth row of the result.
+ *
+ */
+static VALUE
+pgresult_tuple_values(VALUE self, VALUE index)
+{
+	int tuple_num = NUM2INT( index );
+	t_pg_result *this;
+	int field;
+	int num_tuples;
+	int num_fields;
+
+	this = pgresult_get_this_safe(self);
+	num_tuples = PQntuples(this->pgresult);
+	num_fields = PQnfields(this->pgresult);
+
+	if ( tuple_num < 0 || tuple_num >= num_tuples )
+		rb_raise( rb_eIndexError, "Index %d is out of range", tuple_num );
+
+	{
+		PG_VARIABLE_LENGTH_ARRAY(VALUE, row_values, num_fields, PG_MAX_COLUMNS)
+
+		/* populate the row */
+		for ( field = 0; field < num_fields; field++ ) {
+			row_values[field] = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, tuple_num, field);
+		}
+		return rb_ary_new4( num_fields, row_values );
+	}
+}
+
+static void ensure_init_for_tuple(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this_safe(self);
+
+	if( this->field_map == Qnil ){
+		int i;
+		VALUE field_map = rb_hash_new();
+
+		if( this->nfields == -1 )
+			pgresult_init_fnames( self );
+
+		for( i = 0; i < this->nfields; i++ ){
+			rb_hash_aset(field_map, this->fnames[i], INT2FIX(i));
+		}
+		rb_obj_freeze(field_map);
+		this->field_map = field_map;
+	}
+}
+
+/*
+ *  call-seq:
+ *     res.tuple( n )   -> PG::Tuple
+ *
+ *  Returns a PG::Tuple from the nth row of the result.
+ *
+ */
+static VALUE
+pgresult_tuple(VALUE self, VALUE index)
+{
+	int tuple_num = NUM2INT( index );
+	t_pg_result *this;
+	int num_tuples;
+
+	this = pgresult_get_this_safe(self);
+	num_tuples = PQntuples(this->pgresult);
+
+	if ( tuple_num < 0 || tuple_num >= num_tuples )
+		rb_raise( rb_eIndexError, "Index %d is out of range", tuple_num );
+
+	ensure_init_for_tuple(self);
+
+  return pg_tuple_new(self, tuple_num);
 }
 
 
@@ -855,8 +1290,12 @@ pgresult_field_values( VALUE self, VALUE field )
 static VALUE
 pgresult_each(VALUE self)
 {
-	PGresult *result = pgresult_get(self);
+	PGresult *result;
 	int tuple_num;
+
+	RETURN_SIZED_ENUMERATOR(self, 0, NULL, pgresult_ntuples_for_enum);
+
+	result = pgresult_get(self);
 
 	for(tuple_num = 0; tuple_num < PQntuples(result); tuple_num++) {
 		rb_yield(pgresult_aref(self, INT2NUM(tuple_num)));
@@ -868,30 +1307,299 @@ pgresult_each(VALUE self)
  * call-seq:
  *    res.fields() -> Array
  *
- * Returns an array of Strings representing the names of the fields in the result.
+ * Depending on #field_name_type= returns an array of strings or symbols representing the names of the fields in the result.
  */
 static VALUE
 pgresult_fields(VALUE self)
 {
-	PGresult *result = pgresult_get( self );
-	int n = PQnfields( result );
-	VALUE fields = rb_ary_new2( n );
-	int i;
+	t_pg_result *this = pgresult_get_this_safe(self);
 
-	for ( i = 0; i < n; i++ ) {
-		VALUE val = rb_tainted_str_new2(PQfname(result, i));
-		ASSOCIATE_INDEX(val, self);
-		rb_ary_store( fields, i, val );
-	}
+	if( this->nfields == -1 )
+		pgresult_init_fnames( self );
 
-	return fields;
+	return rb_ary_new4( this->nfields, this->fnames );
 }
 
+/*
+ * call-seq:
+ *    res.type_map = typemap
+ *
+ * Set the TypeMap that is used for type casts of result values to ruby objects.
+ *
+ * All value retrieval methods will respect the type map and will do the
+ * type casts from PostgreSQL's wire format to Ruby objects on the fly,
+ * according to the rules and decoders defined in the given typemap.
+ *
+ * +typemap+ must be a kind of PG::TypeMap .
+ *
+ */
+static VALUE
+pgresult_type_map_set(VALUE self, VALUE typemap)
+{
+	t_pg_result *this = pgresult_get_this(self);
+	t_typemap *p_typemap;
+
+	/* Check type of method param */
+	TypedData_Get_Struct(typemap, t_typemap, &pg_typemap_type, p_typemap);
+
+	this->typemap = p_typemap->funcs.fit_to_result( typemap, self );
+	this->p_typemap = RTYPEDDATA_DATA( this->typemap );
+
+	return typemap;
+}
+
+/*
+ * call-seq:
+ *    res.type_map -> value
+ *
+ * Returns the TypeMap that is currently set for type casts of result values to ruby objects.
+ *
+ */
+static VALUE
+pgresult_type_map_get(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this(self);
+
+	return this->typemap;
+}
+
+
+static void
+yield_hash(VALUE self, int ntuples, int nfields)
+{
+	int tuple_num;
+	t_pg_result *this = pgresult_get_this(self);
+	UNUSED(nfields);
+
+	for(tuple_num = 0; tuple_num < ntuples; tuple_num++) {
+		rb_yield(pgresult_aref(self, INT2NUM(tuple_num)));
+	}
+
+	pgresult_clear( this );
+}
+
+static void
+yield_array(VALUE self, int ntuples, int nfields)
+{
+	int row;
+	t_pg_result *this = pgresult_get_this(self);
+
+	for ( row = 0; row < ntuples; row++ ) {
+		PG_VARIABLE_LENGTH_ARRAY(VALUE, row_values, nfields, PG_MAX_COLUMNS)
+		int field;
+
+		/* populate the row */
+		for ( field = 0; field < nfields; field++ ) {
+			row_values[field] = this->p_typemap->funcs.typecast_result_value(this->p_typemap, self, row, field);
+		}
+		rb_yield( rb_ary_new4( nfields, row_values ));
+	}
+
+	pgresult_clear( this );
+}
+
+static void
+yield_tuple(VALUE self, int ntuples, int nfields)
+{
+	int tuple_num;
+	t_pg_result *this = pgresult_get_this(self);
+	VALUE copy;
+	UNUSED(nfields);
+
+	/* make a copy of the base result, that is bound to the PG::Tuple */
+	copy = pg_copy_result(this);
+	/* The copy is now owner of the PGresult and is responsible to PQclear it.
+	 * We clear the pgresult here, so that it's not double freed on error within yield. */
+	this->pgresult = NULL;
+
+	for(tuple_num = 0; tuple_num < ntuples; tuple_num++) {
+		VALUE tuple = pgresult_tuple(copy, INT2FIX(tuple_num));
+		rb_yield( tuple );
+	}
+}
+
+static VALUE
+pgresult_stream_any(VALUE self, void (*yielder)(VALUE, int, int))
+{
+	t_pg_result *this;
+	int nfields;
+	PGconn *pgconn;
+	PGresult *pgresult;
+
+	RETURN_ENUMERATOR(self, 0, NULL);
+
+	this = pgresult_get_this_safe(self);
+	pgconn = pg_get_pgconn(this->connection);
+	pgresult = this->pgresult;
+	nfields = PQnfields(pgresult);
+
+	for(;;){
+		int ntuples = PQntuples(pgresult);
+
+		switch( PQresultStatus(pgresult) ){
+			case PGRES_TUPLES_OK:
+				if( ntuples == 0 )
+					return self;
+				rb_raise( rb_eInvalidResultStatus, "PG::Result is not in single row mode");
+			case PGRES_SINGLE_TUPLE:
+				break;
+			default:
+				pg_result_check( self );
+		}
+
+		yielder( self, ntuples, nfields );
+
+		pgresult = gvl_PQgetResult(pgconn);
+		if( pgresult == NULL )
+			rb_raise( rb_eNoResultError, "no result received - possibly an intersection with another result retrieval");
+
+		if( nfields != PQnfields(pgresult) )
+			rb_raise( rb_eInvalidChangeOfResultFields, "number of fields must not change in single row mode");
+
+		this->pgresult = pgresult;
+	}
+
+	/* never reached */
+	return self;
+}
+
+
+/*
+ * call-seq:
+ *    res.stream_each{ |tuple| ... }
+ *
+ * Invokes block for each tuple in the result set in single row mode.
+ *
+ * This is a convenience method for retrieving all result tuples
+ * as they are transferred. It is an alternative to repeated calls of
+ * PG::Connection#get_result , but given that it avoids the overhead of
+ * wrapping each row into a dedicated result object, it delivers data in nearly
+ * the same speed as with ordinary results.
+ *
+ * The base result must be in status PGRES_SINGLE_TUPLE.
+ * It iterates over all tuples until the status changes to PGRES_TUPLES_OK.
+ * A PG::Error is raised for any errors from the server.
+ *
+ * Row description data does not change while the iteration. All value retrieval
+ * methods refer to only the current row. Result#ntuples returns +1+ while
+ * the iteration and +0+ after all tuples were yielded.
+ *
+ * Example:
+ *   conn.send_query( "first SQL query; second SQL query" )
+ *   conn.set_single_row_mode
+ *   conn.get_result.stream_each do |row|
+ *     # do something with each received row of the first query
+ *   end
+ *   conn.get_result.stream_each do |row|
+ *     # do something with each received row of the second query
+ *   end
+ *   conn.get_result  # => nil   (no more results)
+ */
+static VALUE
+pgresult_stream_each(VALUE self)
+{
+	return pgresult_stream_any(self, yield_hash);
+}
+
+/*
+ * call-seq:
+ *    res.stream_each_row { |row| ... }
+ *
+ * Yields each row of the result set in single row mode.
+ * The row is a list of column values.
+ *
+ * This method works equally to #stream_each , but yields an Array of
+ * values.
+ */
+static VALUE
+pgresult_stream_each_row(VALUE self)
+{
+	return pgresult_stream_any(self, yield_array);
+}
+
+/*
+ * call-seq:
+ *    res.stream_each_tuple { |tuple| ... }
+ *
+ * Yields each row of the result set in single row mode.
+ *
+ * This method works equally to #stream_each , but yields a PG::Tuple object.
+ */
+static VALUE
+pgresult_stream_each_tuple(VALUE self)
+{
+	/* allocate VALUEs that are shared between all streamed tuples */
+	ensure_init_for_tuple(self);
+
+	return pgresult_stream_any(self, yield_tuple);
+}
+
+/*
+ * call-seq:
+ *    res.field_name_type = Symbol
+ *
+ * Set type of field names specific to this result.
+ * It can be set to one of:
+ * * +:string+ to use String based field names
+ * * +:symbol+ to use Symbol based field names
+ * * +:static_symbol+ to use pinned Symbol (can not be garbage collected) - Don't use this, it will probably removed in future.
+ *
+ * The default is retrieved from PG::Connection#field_name_type , which defaults to +:string+ .
+ *
+ * This setting affects several result methods:
+ * * keys of Hash returned by #[] , #each and #stream_each
+ * * #fields
+ * * #fname
+ * * field names used by #tuple and #stream_each_tuple
+ *
+ * The type of field names can only be changed before any of the affected methods have been called.
+ *
+ */
+static VALUE
+pgresult_field_name_type_set(VALUE self, VALUE sym)
+{
+	t_pg_result *this = pgresult_get_this(self);
+	if( this->nfields != -1 ) rb_raise(rb_eArgError, "field names are already materialized");
+
+	this->flags &= ~PG_RESULT_FIELD_NAMES_MASK;
+	if( sym == sym_symbol ) this->flags |= PG_RESULT_FIELD_NAMES_SYMBOL;
+	else if ( sym == sym_static_symbol ) this->flags |= PG_RESULT_FIELD_NAMES_STATIC_SYMBOL;
+	else if ( sym == sym_string );
+	else rb_raise(rb_eArgError, "invalid argument %+"PRIsVALUE, sym);
+
+	return sym;
+}
+
+/*
+ * call-seq:
+ *    res.field_name_type -> Symbol
+ *
+ * Get type of field names.
+ *
+ * See description at #field_name_type=
+ */
+static VALUE
+pgresult_field_name_type_get(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this(self);
+	if( this->flags & PG_RESULT_FIELD_NAMES_SYMBOL ){
+		return sym_symbol;
+	} else if( this->flags & PG_RESULT_FIELD_NAMES_STATIC_SYMBOL ){
+		return sym_static_symbol;
+	} else {
+		return sym_string;
+	}
+}
 
 void
 init_pg_result()
 {
+	sym_string = ID2SYM(rb_intern("string"));
+	sym_symbol = ID2SYM(rb_intern("symbol"));
+	sym_static_symbol = ID2SYM(rb_intern("static_symbol"));
+
 	rb_cPGresult = rb_define_class_under( rb_mPG, "Result", rb_cObject );
+	rb_undef_alloc_func(rb_cPGresult);
 	rb_include_module(rb_cPGresult, rb_mEnumerable);
 	rb_include_module(rb_cPGresult, rb_mPGconstants);
 
@@ -900,6 +1608,10 @@ init_pg_result()
 	rb_define_method(rb_cPGresult, "res_status", pgresult_res_status, 1);
 	rb_define_method(rb_cPGresult, "error_message", pgresult_error_message, 0);
 	rb_define_alias( rb_cPGresult, "result_error_message", "error_message");
+#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
+	rb_define_method(rb_cPGresult, "verbose_error_message", pgresult_verbose_error_message, 2);
+	rb_define_alias( rb_cPGresult, "result_verbose_error_message", "verbose_error_message");
+#endif
 	rb_define_method(rb_cPGresult, "error_field", pgresult_error_field, 1);
 	rb_define_alias( rb_cPGresult, "result_error_field", "error_field" );
 	rb_define_method(rb_cPGresult, "clear", pg_result_clear, 0);
@@ -932,8 +1644,22 @@ init_pg_result()
 	rb_define_method(rb_cPGresult, "each", pgresult_each, 0);
 	rb_define_method(rb_cPGresult, "fields", pgresult_fields, 0);
 	rb_define_method(rb_cPGresult, "each_row", pgresult_each_row, 0);
+	rb_define_method(rb_cPGresult, "values", pgresult_values, 0);
 	rb_define_method(rb_cPGresult, "column_values", pgresult_column_values, 1);
 	rb_define_method(rb_cPGresult, "field_values", pgresult_field_values, 1);
+	rb_define_method(rb_cPGresult, "tuple_values", pgresult_tuple_values, 1);
+	rb_define_method(rb_cPGresult, "tuple", pgresult_tuple, 1);
+	rb_define_method(rb_cPGresult, "cleared?", pgresult_cleared_p, 0);
+	rb_define_method(rb_cPGresult, "autoclear?", pgresult_autoclear_p, 0);
+
+	rb_define_method(rb_cPGresult, "type_map=", pgresult_type_map_set, 1);
+	rb_define_method(rb_cPGresult, "type_map", pgresult_type_map_get, 0);
+
+	/******     PG::Result INSTANCE METHODS: streaming     ******/
+	rb_define_method(rb_cPGresult, "stream_each", pgresult_stream_each, 0);
+	rb_define_method(rb_cPGresult, "stream_each_row", pgresult_stream_each_row, 0);
+	rb_define_method(rb_cPGresult, "stream_each_tuple", pgresult_stream_each_tuple, 0);
+
+	rb_define_method(rb_cPGresult, "field_name_type=", pgresult_field_name_type_set, 1 );
+	rb_define_method(rb_cPGresult, "field_name_type", pgresult_field_name_type_get, 0 );
 }
-
-

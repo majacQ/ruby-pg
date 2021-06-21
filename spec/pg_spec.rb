@@ -1,31 +1,53 @@
-#!/usr/bin/env rspec
+# -*- rspec -*-
 # encoding: utf-8
 
-BEGIN {
-	require 'pathname'
+require_relative 'helpers'
 
-	basedir = Pathname( __FILE__ ).dirname.parent
-	libdir = basedir + 'lib'
-
-	$LOAD_PATH.unshift( basedir.to_s ) unless $LOAD_PATH.include?( basedir.to_s )
-	$LOAD_PATH.unshift( libdir.to_s ) unless $LOAD_PATH.include?( libdir.to_s )
-}
-
-require 'rspec'
-require 'spec/lib/helpers'
 require 'pg'
 
 describe PG do
 
-	it "knows what version of the libpq library is loaded", :postgresql_91 do
-		PG.library_version.should be_an( Integer )
-		PG.library_version.should >= 90100
+	it "knows what version of the libpq library is loaded" do
+		expect( PG.library_version ).to be_an( Integer )
+		expect( PG.library_version ).to be >= 90100
+	end
+
+	it "can select which of both security libraries to initialize" do
+		# This setting does nothing here, because there is already a connection
+		# to the server, at this point in time.
+		PG.init_openssl(false, true)
+		PG.init_openssl(1, 0)
+	end
+
+	it "can select whether security libraries to initialize" do
+		# This setting does nothing here, because there is already a connection
+		# to the server, at this point in time.
+		PG.init_ssl(false)
+		PG.init_ssl(1)
 	end
 
 
 	it "knows whether or not the library is threadsafe" do
-		PG.should be_threadsafe()
+		expect( PG ).to be_threadsafe()
+	end
+
+	it "does have hierarchical error classes" do
+		expect( PG::UndefinedTable.ancestors[0,4] ).to eq([
+				PG::UndefinedTable,
+				PG::SyntaxErrorOrAccessRuleViolation,
+				PG::ServerError,
+		        PG::Error
+		        ])
+
+		expect( PG::InvalidSchemaName.ancestors[0,3] ).to eq([
+				PG::InvalidSchemaName,
+				PG::ServerError,
+		        PG::Error
+		        ])
+	end
+
+	it "tells about the libpq library path" do
+		expect( PG::POSTGRESQL_LIB_PATH ).to include("/")
 	end
 
 end
-

@@ -1,4 +1,5 @@
-#!/usr/bin/env ruby
+# -*- ruby -*-
+# frozen_string_literal: true
 
 require 'pg' unless defined?( PG )
 

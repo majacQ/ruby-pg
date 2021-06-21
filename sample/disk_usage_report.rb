@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+# -*- ruby -*-
 # vim: set noet nosta sw=4 ts=4 :
 #
 # Quickly dump size information for a given database.
@@ -10,19 +10,10 @@
 #
 
 
-begin
-	require 'ostruct'
-	require 'optparse'
-	require 'etc'
-	require 'pg'
-
-rescue LoadError # 1.8 support
-	unless Object.const_defined?( :Gem )
-		require 'rubygems'
-		retry
-	end
-	raise
-end
+require 'ostruct'
+require 'optparse'
+require 'etc'
+require 'pg'
 
 SCRIPT_VERSION = %q$Id$
 
@@ -42,7 +33,7 @@ def report( opts )
 	# -----------------------------------------
 
 	db_info = db.exec %Q{
-		SELECT 
+		SELECT
 			count(oid) AS num_relations,
 			pg_size_pretty(pg_database_size('#{opts.database}')) AS dbsize
 		FROM

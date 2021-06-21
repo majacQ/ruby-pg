@@ -15,29 +15,54 @@ if pgdir = with_config( 'pg' )
 	ENV['PATH'] = "#{pgdir}/bin" + File::PATH_SEPARATOR + ENV['PATH']
 end
 
-if ENV['CROSS_COMPILING']
-	$LDFLAGS << " -L#{CONFIG['libdir']}"
+if enable_config("windows-cross")
+	# Avoid dependency to external libgcc.dll on x86-mingw32
+	$LDFLAGS << " -static-libgcc"
+	# Don't use pg_config for cross build, but --with-pg-* path options
+	dir_config 'pg'
 
-	# Link against all required libraries for static build, if they are available
-	have_library( 'crypt32', 'CertOpenStore' ) && append_library( $libs, 'crypt32' )
-	have_library( 'gdi32', 'CreateDC' ) && append_library( $libs, 'gdi32' )
-	have_library( 'secur32' ) && append_library( $libs, 'secur32' )
-	have_library( 'ws2_32', 'WSASocket') && append_library( $libs, 'ws2_32' )
-	have_library( 'crypto', 'BIO_new' ) && append_library( $libs, 'crypto' )
-	have_library( 'ssl', 'SSL_new' ) && append_library( $libs, 'ssl' )
+else
+	# Native build
+
+	pgconfig = with_config('pg-config') ||
+		with_config('pg_config') ||
+		find_executable('pg_config')
+
+	if pgconfig && pgconfig != 'ignore'
+		$stderr.puts "Using config values from %s" % [ pgconfig ]
+		incdir = `"#{pgconfig}" --includedir`.chomp
+		libdir = `"#{pgconfig}" --libdir`.chomp
+		dir_config 'pg', incdir, libdir
+
+		# Windows traditionally stores DLLs beside executables, not in libdir
+		dlldir = RUBY_PLATFORM=~/mingw|mswin/ ? `"#{pgconfig}" --bindir`.chomp : libdir
+
+	else
+		$stderr.puts "No pg_config... trying anyway. If building fails, please try again with",
+			" --with-pg-config=/path/to/pg_config"
+		incdir, libdir = dir_config 'pg'
+		dlldir = libdir
+	end
+
+	# Try to use runtime path linker option, even if RbConfig doesn't know about it.
+	# The rpath option is usually set implicit by dir_config(), but so far not
+	# on MacOS-X.
+	if dlldir && RbConfig::CONFIG["RPATHFLAG"].to_s.empty?
+		append_ldflags "-Wl,-rpath,#{dlldir.quote}"
+	end
 end
 
-dir_config 'pg'
+File.write("postgresql_lib_path.rb", <<-EOT)
+module PG
+	POSTGRESQL_LIB_PATH = #{dlldir.inspect}
+end
+EOT
+$INSTALLFILES = {
+	"./postgresql_lib_path.rb" => "$(RUBYLIBDIR)/pg/"
+}
 
-if pgconfig = ( with_config('pg-config') || with_config('pg_config') || find_executable('pg_config') )
-	$stderr.puts "Using config values from %s" % [ pgconfig ]
-	$CPPFLAGS << " -I%s" % [ `"#{pgconfig}" --includedir`.chomp ]
-
-	libdir = `"#{pgconfig}" --libdir`.chomp
-	$LDFLAGS << " -L%s -Wl,-rpath,%s" % [ libdir, libdir ]
-else
-	$stderr.puts "No pg_config... trying anyway. If building fails, please try again with",
-		" --with-pg-config=/path/to/pg_config"
+if RUBY_VERSION >= '2.3.0' && /solaris/ =~ RUBY_PLATFORM
+	append_cppflags( '-D__EXTENSIONS__' )
 end
 
 find_header( 'libpq-fe.h' ) or abort "Can't find the 'libpq-fe.h header"
@@ -49,41 +74,35 @@ abort "Can't find the PostgreSQL client library (libpq)" unless
 	have_library( 'libpq', 'PQconnectdb', ['libpq-fe.h'] ) ||
 	have_library( 'ms/libpq', 'PQconnectdb', ['libpq-fe.h'] )
 
+if /mingw/ =~ RUBY_PLATFORM && RbConfig::MAKEFILE_CONFIG['CC'] =~ /gcc/
+	# Work around: https://sourceware.org/bugzilla/show_bug.cgi?id=22504
+	checking_for "workaround gcc version with link issue" do
+		`#{RbConfig::MAKEFILE_CONFIG['CC']} --version`.chomp =~ /\s(\d+)\.\d+\.\d+(\s|$)/ &&
+			$1.to_i >= 6 &&
+			have_library(':libpq.lib') # Prefer linking to libpq.lib over libpq.dll if available
+	end
+end
+
 # optional headers/functions
-have_func 'PQconnectionUsedPassword' or
+have_func 'PQsetSingleRowMode' or
 	abort "Your PostgreSQL is too old. Either install an older version " +
-	      "of this gem or upgrade your database."
-have_func 'PQisthreadsafe'
-have_func 'PQprepare'
-have_func 'PQexecParams'
-have_func 'PQescapeString'
-have_func 'PQescapeStringConn'
-have_func 'PQescapeLiteral'
-have_func 'PQescapeIdentifier'
-have_func 'PQgetCancel'
-have_func 'lo_create'
-have_func 'pg_encoding_to_char'
-have_func 'pg_char_to_encoding'
-have_func 'PQsetClientEncoding'
-have_func 'PQlibVersion'
-have_func 'PQping'
-have_func 'PQsetSingleRowMode'
-
-have_func 'rb_encdb_alias'
-have_func 'rb_enc_alias'
-have_func 'rb_thread_call_without_gvl'
-have_func 'rb_thread_call_with_gvl'
-have_func 'rb_thread_fd_select'
-
-have_const 'PGRES_COPY_BOTH', 'libpq-fe.h'
-have_const 'PGRES_SINGLE_TUPLE', 'libpq-fe.h'
-
-$defs.push( "-DHAVE_ST_NOTIFY_EXTRA" ) if
-	have_struct_member 'struct pgNotify', 'extra', 'libpq-fe.h'
+	      "of this gem or upgrade your database to at least PostgreSQL-9.2."
+have_func 'PQconninfo' # since PostgreSQL-9.3
+have_func 'PQsslAttribute' # since PostgreSQL-9.5
+have_func 'PQresultVerboseErrorMessage' # since PostgreSQL-9.6
+have_func 'PQencryptPasswordConn' # since PostgreSQL-10
+have_func 'PQresultMemorySize' # since PostgreSQL-12
+have_func 'timegm'
+have_func 'rb_gc_adjust_memory_usage' # since ruby-2.4
+have_func 'rb_gc_mark_movable' # since ruby-2.7
 
 # unistd.h confilicts with ruby/win32.h when cross compiling for win32 and ruby 1.9.1
 have_header 'unistd.h'
-have_header 'ruby/st.h' or have_header 'st.h' or abort "pg currently requires the ruby/st.h header"
+have_header 'inttypes.h'
+
+checking_for "C99 variable length arrays" do
+	$defs.push( "-DHAVE_VARIABLE_LENGTH_ARRAYS" ) if try_compile('void test_vla(int l){ int vla[l]; }')
+end
 
 create_header()
 create_makefile( "pg_ext" )

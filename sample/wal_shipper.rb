@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+# -*- ruby -*-
 #
 # A script to wrap ssh and rsync for PostgreSQL WAL files shipping.
 # Mahlon E. Smith <mahlon@martini.nu>
@@ -350,7 +350,7 @@ module WalShipper
 		###
 		def dispatch_dest( dest )
 			if ! dest.enabled.nil? && ! dest.enabled
-				self.log "Skipping explicity disabled destination %p, WAL is queued." % [ dest.label ]
+				self.log "Skipping explicitly disabled destination %p, WAL is queued." % [ dest.label ]
 				return
 			end
 
@@ -416,7 +416,7 @@ rsync: /usr/bin/rsync
 ssh: /usr/bin/ssh
 ssh_timeout: 10
 
-destinations: 
+destinations:
 
 - label: rsync-example
   port: 2222

@@ -7,6 +7,7 @@
  * - Jeff Davis <ruby-pg@j-davis.com>
  * - Guy Decoux (ts) <decoux@moulon.inra.fr>
  * - Michael Granger <ged@FaerieMUD.org>
+ * - Lars Kanis <lars@greiz-reinsdorf.de>
  * - Dave Lee
  * - Eiji Matsumoto <usagi@ruby.club.or.jp>
  * - Yukihiro Matsumoto <matz@ruby-lang.org>
@@ -15,10 +16,10 @@
  * See Contributors.rdoc for the many additional fine people that have contributed
  * to this library over the years.
  *
- * Copyright (c) 1997-2012 by the authors.
+ * Copyright (c) 1997-2019 by the authors.
  *
  * You may redistribute this software under the same terms as Ruby itself; see
- * http://www.ruby-lang.org/en/LICENSE.txt or the LICENSE file in the source
+ * https://www.ruby-lang.org/en/about/license.txt or the BSDL file in the source
  * for details.
  *
  * Portions of the code are from the PostgreSQL project, and are distributed
@@ -47,8 +48,8 @@
 
 #include "pg.h"
 
+int pg_skip_deprecation_warning;
 VALUE rb_mPG;
-VALUE rb_ePGerror;
 VALUE rb_mPGconstants;
 
 
@@ -69,7 +70,6 @@ VALUE rb_mPGconstants;
  * M17n functions
  */
 
-#ifdef M17N_SUPPORTED
 /**
  * The mapping from canonical encoding names in PostgreSQL to ones in Ruby.
  */
@@ -124,24 +124,6 @@ const char * const (pg_enc_pg2ruby_mapping[][2]) = {
  * A cache of mapping from PostgreSQL's encoding indices to Ruby's rb_encoding*s.
  */
 static struct st_table *enc_pg2ruby;
-static ID s_id_index;
-
-
-/*
- * Get the index of encoding +val+.
- * :FIXME: Look into replacing this with rb_enc_get_index() since 1.9.1 isn't really
- * used anymore.
- */
-int
-pg_enc_get_index(VALUE val)
-{
-	int i = ENCODING_GET_INLINED(val);
-	if (i == ENCODING_INLINE_MAX) {
-		VALUE iv = rb_ivar_get(val, s_id_index);
-		i = NUM2INT(iv);
-	}
-	return i;
-}
 
 
 /*
@@ -161,9 +143,6 @@ pg_find_or_create_johab(void)
 	}
 
 	enc_index = rb_define_dummy_encoding(aliases[0]);
-	for (i = 1; i < sizeof(aliases)/sizeof(aliases[0]); ++i) {
-		ENC_ALIAS(aliases[i], aliases[0]);
-	}
 	return rb_enc_from_index(enc_index);
 }
 
@@ -247,14 +226,55 @@ pg_get_rb_encoding_as_pg_encoding( rb_encoding *enc )
 	return encname;
 }
 
-#endif /* M17N_SUPPORTED */
+
+/*
+ * Ensures that the given string has enough capacity to take expand_len
+ * more data bytes. The new data part of the String is not initialized.
+ *
+ * current_out must be a pointer within the data part of the String object.
+ * This pointer is returned and possibly adjusted, because the location of the data
+ * part of the String can change through this function.
+ *
+ * PG_RB_STR_ENSURE_CAPA can be used to do fast inline checks of the remaining capacity.
+ * end_capa it is then set to the first byte after the currently reserved memory,
+ * if not NULL.
+ *
+ * Before the String can be used with other string functions or returned to Ruby space,
+ * the string length has to be set with rb_str_set_len().
+ *
+ * Usage example:
+ *
+ *   VALUE string;
+ *   char *current_out, *end_capa;
+ *   PG_RB_STR_NEW( string, current_out, end_capa );
+ *   while( data_is_going_to_be_processed ){
+ *     PG_RB_STR_ENSURE_CAPA( string, 2, current_out, end_capa );
+ *     *current_out++ = databyte1;
+ *     *current_out++ = databyte2;
+ *   }
+ *   rb_str_set_len( string, current_out - RSTRING_PTR(string) );
+ *
+ */
+char *
+pg_rb_str_ensure_capa( VALUE str, long expand_len, char *curr_ptr, char **end_ptr )
+{
+	long curr_len = curr_ptr - RSTRING_PTR(str);
+	long curr_capa = rb_str_capacity( str );
+	if( curr_capa < curr_len + expand_len ){
+		rb_str_set_len( str, curr_len );
+		rb_str_modify_expand( str, (curr_len + expand_len) * 2 - curr_capa );
+		curr_ptr = RSTRING_PTR(str) + curr_len;
+	}
+	if( end_ptr )
+		*end_ptr = RSTRING_PTR(str) + rb_str_capacity( str );
+	return curr_ptr;
+}
 
 
 /**************************************************************************
  * Module Methods
  **************************************************************************/
 
-#ifdef HAVE_PQLIBVERSION
 /*
  * call-seq:
  *   PG.library_version -> Integer
@@ -272,7 +292,6 @@ pg_s_library_version(VALUE self)
 	UNUSED( self );
 	return INT2NUM(PQlibVersion());
 }
-#endif
 
 
 /*
@@ -290,6 +309,66 @@ pg_s_threadsafe_p(VALUE self)
 	return PQisthreadsafe() ? Qtrue : Qfalse;
 }
 
+static int
+pg_to_bool_int(VALUE value)
+{
+	switch( TYPE(value) ){
+		case T_FALSE:
+			return 0;
+		case T_TRUE:
+			return 1;
+		default:
+			return NUM2INT(value);
+	}
+}
+
+/*
+ * call-seq:
+ *    PG.init_openssl(do_ssl, do_crypto)  -> nil
+ *
+ * Allows applications to select which security libraries to initialize.
+ *
+ * If your application initializes libssl and/or libcrypto libraries and libpq is
+ * built with SSL support, you should call PG.init_openssl() to tell libpq that the
+ * libssl and/or libcrypto libraries have been initialized by your application,
+ * so that libpq will not also initialize those libraries.
+ *
+ * When do_ssl is +true+, libpq will initialize the OpenSSL library before first
+ * opening a database connection. When do_crypto is +true+, the libcrypto library
+ * will be initialized. By default (if PG.init_openssl() is not called), both libraries
+ * are initialized. When SSL support is not compiled in, this function is present but does nothing.
+ *
+ * If your application uses and initializes either OpenSSL or its underlying libcrypto library,
+ * you must call this function with +false+ for the appropriate parameter(s) before first opening
+ * a database connection. Also be sure that you have done that initialization before opening a
+ * database connection.
+ *
+ */
+static VALUE
+pg_s_init_openssl(VALUE self, VALUE do_ssl, VALUE do_crypto)
+{
+	UNUSED( self );
+	PQinitOpenSSL(pg_to_bool_int(do_ssl), pg_to_bool_int(do_crypto));
+	return Qnil;
+}
+
+
+/*
+ * call-seq:
+ *    PG.init_ssl(do_ssl)  -> nil
+ *
+ * Allows applications to select which security libraries to initialize.
+ *
+ * This function is equivalent to <tt>PG.init_openssl(do_ssl, do_ssl)</tt> . It is sufficient for
+ * applications that initialize both or neither of OpenSSL and libcrypto.
+ */
+static VALUE
+pg_s_init_ssl(VALUE self, VALUE do_ssl)
+{
+	UNUSED( self );
+	PQinitSSL(pg_to_bool_int(do_ssl));
+	return Qnil;
+}
 
 
 /**************************************************************************
@@ -299,26 +378,27 @@ pg_s_threadsafe_p(VALUE self)
 void
 Init_pg_ext()
 {
+	if( RTEST(rb_eval_string("ENV['PG_SKIP_DEPRECATION_WARNING']")) ){
+		/* Set all bits to disable all deprecation warnings. */
+		pg_skip_deprecation_warning = 0xFFFF;
+	} else {
+		pg_skip_deprecation_warning = 0;
+	}
+
 	rb_mPG = rb_define_module( "PG" );
-	rb_ePGerror = rb_define_class_under( rb_mPG, "Error", rb_eStandardError );
 	rb_mPGconstants = rb_define_module_under( rb_mPG, "Constants" );
 
 	/*************************
 	 *  PG module methods
 	 *************************/
-#ifdef HAVE_PQLIBVERSION
 	rb_define_singleton_method( rb_mPG, "library_version", pg_s_library_version, 0 );
-#endif
 	rb_define_singleton_method( rb_mPG, "isthreadsafe", pg_s_threadsafe_p, 0 );
 	SINGLETON_ALIAS( rb_mPG, "is_threadsafe?", "isthreadsafe" );
 	SINGLETON_ALIAS( rb_mPG, "threadsafe?", "isthreadsafe" );
 
-	/*************************
-	 *  PG::Error
-	 *************************/
-	rb_define_alias( rb_ePGerror, "error", "message" );
-	rb_define_attr( rb_ePGerror, "connection", 1, 0 );
-	rb_define_attr( rb_ePGerror, "result", 1, 0 );
+  rb_define_singleton_method( rb_mPG, "init_openssl", pg_s_init_openssl, 2 );
+  rb_define_singleton_method( rb_mPG, "init_ssl", pg_s_init_ssl, 1 );
+
 
 	/******     PG::Connection CLASS CONSTANTS: Connection Status     ******/
 
@@ -341,7 +421,7 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "CONNECTION_SSL_STARTUP", INT2FIX(CONNECTION_SSL_STARTUP));
 	/* Negotiating environment-driven parameter settings. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_SETENV", INT2FIX(CONNECTION_SETENV));
-	/* Internal state: connect() needed. */
+	/* Internal state - PG.connect() needed. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_NEEDED", INT2FIX(CONNECTION_NEEDED));
 
 	/******     PG::Connection CLASS CONSTANTS: Nonblocking connection polling status     ******/
@@ -357,27 +437,48 @@ Init_pg_ext()
 
 	/******     PG::Connection CLASS CONSTANTS: Transaction Status     ******/
 
-	/* Transaction is currently idle (#transaction_status) */
+	/* Transaction is currently idle ( Connection#transaction_status ) */
 	rb_define_const(rb_mPGconstants, "PQTRANS_IDLE", INT2FIX(PQTRANS_IDLE));
-	/* Transaction is currently active; query has been sent to the server, but not yet completed. (#transaction_status) */
+	/* Transaction is currently active; query has been sent to the server, but not yet completed. ( Connection#transaction_status ) */
 	rb_define_const(rb_mPGconstants, "PQTRANS_ACTIVE", INT2FIX(PQTRANS_ACTIVE));
-	/* Transaction is currently idle, in a valid transaction block (#transaction_status) */
+	/* Transaction is currently idle, in a valid transaction block ( Connection#transaction_status ) */
 	rb_define_const(rb_mPGconstants, "PQTRANS_INTRANS", INT2FIX(PQTRANS_INTRANS));
-	/* Transaction is currently idle, in a failed transaction block (#transaction_status) */
+	/* Transaction is currently idle, in a failed transaction block ( Connection#transaction_status ) */
 	rb_define_const(rb_mPGconstants, "PQTRANS_INERROR", INT2FIX(PQTRANS_INERROR));
-	/* Transaction's connection is bad (#transaction_status) */
+	/* Transaction's connection is bad ( Connection#transaction_status ) */
 	rb_define_const(rb_mPGconstants, "PQTRANS_UNKNOWN", INT2FIX(PQTRANS_UNKNOWN));
 
 	/******     PG::Connection CLASS CONSTANTS: Error Verbosity     ******/
 
-	/* Terse error verbosity level (#set_error_verbosity) */
+	/* Error verbosity level ( Connection#set_error_verbosity ).
+	 * In TERSE mode, returned messages include severity, primary text, and position only; this will normally fit on a single line. */
 	rb_define_const(rb_mPGconstants, "PQERRORS_TERSE", INT2FIX(PQERRORS_TERSE));
-	/* Default error verbosity level (#set_error_verbosity) */
+	/* Error verbosity level ( Connection#set_error_verbosity ).
+	 * The DEFAULT mode produces messages that include the above plus any detail, hint, or context fields (these might span multiple lines). */
 	rb_define_const(rb_mPGconstants, "PQERRORS_DEFAULT", INT2FIX(PQERRORS_DEFAULT));
-	/* Verbose error verbosity level (#set_error_verbosity) */
+	/* Error verbosity level ( Connection#set_error_verbosity ).
+	 * The VERBOSE mode includes all available fields. */
 	rb_define_const(rb_mPGconstants, "PQERRORS_VERBOSE", INT2FIX(PQERRORS_VERBOSE));
 
-#ifdef HAVE_PQPING
+/* PQERRORS_SQLSTATE was introduced in PG-12 together with PQresultMemorySize() */
+#ifdef HAVE_PQRESULTMEMORYSIZE
+	/* Error verbosity level ( Connection#set_error_verbosity ).
+	 * The SQLSTATE mode includes only the error severity and the SQLSTATE error code, if one is available (if not, the output is like TERSE mode).
+	 *
+	 * Available since PostgreSQL-12.
+	 */
+	rb_define_const(rb_mPGconstants, "PQERRORS_SQLSTATE", INT2FIX(PQERRORS_SQLSTATE));
+#endif
+
+#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
+	/* See Connection#set_error_context_visibility */
+	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_NEVER", INT2FIX(PQSHOW_CONTEXT_NEVER));
+	/* See Connection#set_error_context_visibility */
+	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ERRORS", INT2FIX(PQSHOW_CONTEXT_ERRORS));
+	/* See Connection#set_error_context_visibility */
+	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ALWAYS", INT2FIX(PQSHOW_CONTEXT_ALWAYS));
+#endif
+
 	/******     PG::Connection CLASS CONSTANTS: Check Server Status ******/
 
 	/* Server is accepting connections. */
@@ -388,123 +489,161 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "PQPING_NO_RESPONSE", INT2FIX(PQPING_NO_RESPONSE));
 	/* Connection not attempted (bad params). */
 	rb_define_const(rb_mPGconstants, "PQPING_NO_ATTEMPT", INT2FIX(PQPING_NO_ATTEMPT));
-#endif
 
 	/******     PG::Connection CLASS CONSTANTS: Large Objects     ******/
 
-	/* Flag for #lo_creat, #lo_open -- open for writing */
+	/* Flag for Connection#lo_creat, Connection#lo_open -- open for writing */
 	rb_define_const(rb_mPGconstants, "INV_WRITE", INT2FIX(INV_WRITE));
-	/* Flag for #lo_creat, #lo_open -- open for reading */
+	/* Flag for Connection#lo_creat, Connection#lo_open -- open for reading */
 	rb_define_const(rb_mPGconstants, "INV_READ", INT2FIX(INV_READ));
-	/* Flag for #lo_lseek -- seek from object start */
+	/* Flag for Connection#lo_lseek -- seek from object start */
 	rb_define_const(rb_mPGconstants, "SEEK_SET", INT2FIX(SEEK_SET));
-	/* Flag for #lo_lseek -- seek from current position */
+	/* Flag for Connection#lo_lseek -- seek from current position */
 	rb_define_const(rb_mPGconstants, "SEEK_CUR", INT2FIX(SEEK_CUR));
-	/* Flag for #lo_lseek -- seek from object end */
+	/* Flag for Connection#lo_lseek -- seek from object end */
 	rb_define_const(rb_mPGconstants, "SEEK_END", INT2FIX(SEEK_END));
 
 	/******     PG::Result CONSTANTS: result status      ******/
 
-	/* #result_status constant: The string sent to the server was empty. */
+	/* Result#result_status constant - The string sent to the server was empty. */
 	rb_define_const(rb_mPGconstants, "PGRES_EMPTY_QUERY", INT2FIX(PGRES_EMPTY_QUERY));
-	/* #result_status constant: Successful completion of a command returning no data. */
+	/* Result#result_status constant - Successful completion of a command returning no data. */
 	rb_define_const(rb_mPGconstants, "PGRES_COMMAND_OK", INT2FIX(PGRES_COMMAND_OK));
-		/* #result_status constant: Successful completion of a command returning data
-	   (such as a SELECT or SHOW). */
+	/* Result#result_status constant - Successful completion of a command returning data (such as a SELECT or SHOW). */
 	rb_define_const(rb_mPGconstants, "PGRES_TUPLES_OK", INT2FIX(PGRES_TUPLES_OK));
-	/* #result_status constant: Copy Out (from server) data transfer started. */
+	/* Result#result_status constant - Copy Out (from server) data transfer started. */
 	rb_define_const(rb_mPGconstants, "PGRES_COPY_OUT", INT2FIX(PGRES_COPY_OUT));
-	/* #result_status constant: Copy In (to server) data transfer started. */
+	/* Result#result_status constant - Copy In (to server) data transfer started. */
 	rb_define_const(rb_mPGconstants, "PGRES_COPY_IN", INT2FIX(PGRES_COPY_IN));
-	/* #result_status constant: The server’s response was not understood. */
+	/* Result#result_status constant - The server’s response was not understood. */
 	rb_define_const(rb_mPGconstants, "PGRES_BAD_RESPONSE", INT2FIX(PGRES_BAD_RESPONSE));
-	/* #result_status constant: A nonfatal error (a notice or warning) occurred. */
+	/* Result#result_status constant - A nonfatal error (a notice or warning) occurred. */
 	rb_define_const(rb_mPGconstants, "PGRES_NONFATAL_ERROR",INT2FIX(PGRES_NONFATAL_ERROR));
-	/* #result_status constant: A fatal error occurred. */
+	/* Result#result_status constant - A fatal error occurred. */
 	rb_define_const(rb_mPGconstants, "PGRES_FATAL_ERROR", INT2FIX(PGRES_FATAL_ERROR));
-	/* #result_status constant: Copy In/Out data transfer in progress. */
-#ifdef HAVE_CONST_PGRES_COPY_BOTH
+	/* Result#result_status constant - Copy In/Out data transfer in progress. */
 	rb_define_const(rb_mPGconstants, "PGRES_COPY_BOTH", INT2FIX(PGRES_COPY_BOTH));
-#endif
-	/* #result_status constant: Single tuple from larger resultset. */
-#ifdef HAVE_CONST_PGRES_SINGLE_TUPLE
+	/* Result#result_status constant - Single tuple from larger resultset. */
 	rb_define_const(rb_mPGconstants, "PGRES_SINGLE_TUPLE", INT2FIX(PGRES_SINGLE_TUPLE));
-#endif
 
 	/******     Result CONSTANTS: result error field codes      ******/
 
-	/* #result_error_field argument constant: The severity; the field contents
-	 * are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE,
-	 * DEBUG, INFO, or LOG (in a notice message), or a localized translation
-	 * of one of these. Always present.
+	/* Result#result_error_field argument constant
+	 *
+	 * The severity; the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message), or a localized translation
+	 * of one of these.
+	 * Always present.
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY", INT2FIX(PG_DIAG_SEVERITY));
 
-	/* #result_error_field argument constant: The SQLSTATE code for the
-	 * error. The SQLSTATE code identies the type of error that has occurred;
-	 * it can be used by front-end applications to perform specic operations
-	 * (such as er- ror handling) in response to a particular database
-	 * error. For a list of the possible SQLSTATE codes, see Appendix A.
-	 * This eld is not localizable, and is always present.
+#ifdef PG_DIAG_SEVERITY_NONLOCALIZED
+	/* Result#result_error_field argument constant
+	 *
+	 * The severity; the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message).
+	 * This is identical to the PG_DIAG_SEVERITY field except that the contents are never localized.
+	 *
+	 * Available since PostgreSQL-9.6
+	 */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY_NONLOCALIZED", INT2FIX(PG_DIAG_SEVERITY_NONLOCALIZED));
+#endif
+	/* Result#result_error_field argument constant
+	 *
+	 * The SQLSTATE code for the error.
+	 * The SQLSTATE code identies the type of error that has occurred; it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
+	 * For a list of the possible SQLSTATE codes, see Appendix A.
+	 * This field is not localizable, and is always present.
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SQLSTATE", INT2FIX(PG_DIAG_SQLSTATE));
-
-	/* #result_error_field argument constant: The primary human-readable
-	 * error message (typically one line). Always present. */
+	/* Result#result_error_field argument constant
+	 *
+	 * The primary human-readable error message (typically one line).
+	 * Always present. */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_MESSAGE_PRIMARY", INT2FIX(PG_DIAG_MESSAGE_PRIMARY));
-
-	/* #result_error_field argument constant: Detail: an optional secondary
-	 * error message carrying more detail about the problem. Might run to
-	 * multiple lines.
+	/* Result#result_error_field argument constant
+	 *
+	 * Detail: an optional secondary error message carrying more detail about the problem.
+	 * Might run to multiple lines.
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_MESSAGE_DETAIL", INT2FIX(PG_DIAG_MESSAGE_DETAIL));
-
-	/* #result_error_field argument constant: Hint: an optional suggestion
-	 * what to do about the problem. This is intended to differ from detail
-	 * in that it offers advice (potentially inappropriate) rather than
-	 * hard facts. Might run to multiple lines.
+	/* Result#result_error_field argument constant
+	 *
+	 * Hint: an optional suggestion what to do about the problem.
+	 * This is intended to differ from detail in that it offers advice (potentially inappropriate) rather than hard facts.
+	 * Might run to multiple lines.
 	 */
-
 	rb_define_const(rb_mPGconstants, "PG_DIAG_MESSAGE_HINT", INT2FIX(PG_DIAG_MESSAGE_HINT));
-	/* #result_error_field argument constant: A string containing a decimal
-	 * integer indicating an error cursor position as an index into the
-	 * original statement string. The rst character has index 1, and
-	 * positions are measured in characters not bytes.
+	/* Result#result_error_field argument constant
+	 *
+	 * A string containing a decimal integer indicating an error cursor position as an index into the original statement string.
+	 *
+	 * The first character has index 1, and positions are measured in characters not bytes.
 	 */
-
 	rb_define_const(rb_mPGconstants, "PG_DIAG_STATEMENT_POSITION", INT2FIX(PG_DIAG_STATEMENT_POSITION));
-	/* #result_error_field argument constant: This is dened the same as
-	 * the PG_DIAG_STATEMENT_POSITION eld, but it is used when the cursor
-	 * position refers to an internally generated command rather than the
-	 * one submitted by the client. The PG_DIAG_INTERNAL_QUERY eld will
-	 * always appear when this eld appears.
+	/* Result#result_error_field argument constant
+	 *
+	 * This is defined the same as the PG_DIAG_STATEMENT_POSITION field, but it is used when the cursor position refers to an internally generated command rather than the one submitted by the client.
+	 * The PG_DIAG_INTERNAL_QUERY field will always appear when this field appears.
 	 */
-
 	rb_define_const(rb_mPGconstants, "PG_DIAG_INTERNAL_POSITION", INT2FIX(PG_DIAG_INTERNAL_POSITION));
-	/* #result_error_field argument constant: The text of a failed
-	 * internally-generated command. This could be, for example, a SQL
-	 * query issued by a PL/pgSQL function.
+	/* Result#result_error_field argument constant
+	 *
+	 * The text of a failed internally-generated command.
+	 * This could be, for example, a SQL query issued by a PL/pgSQL function.
 	 */
-
 	rb_define_const(rb_mPGconstants, "PG_DIAG_INTERNAL_QUERY", INT2FIX(PG_DIAG_INTERNAL_QUERY));
-	/* #result_error_field argument constant: An indication of the context
-	 * in which the error occurred. Presently this includes a call stack
-	 * traceback of active procedural language functions and internally-generated
-	 * queries. The trace is one entry per line, most recent rst.
+	/* Result#result_error_field argument constant
+	 *
+	 * An indication of the context in which the error occurred.
+	 * Presently this includes a call stack traceback of active procedural language functions and internally-generated queries.
+	 * The trace is one entry per line, most recent first.
 	 */
-
 	rb_define_const(rb_mPGconstants, "PG_DIAG_CONTEXT", INT2FIX(PG_DIAG_CONTEXT));
-	/* #result_error_field argument constant: The le name of the source-code
-	 * location where the error was reported. */
+	/* Result#result_error_field argument constant
+	 *
+	 * The file name of the source-code location where the error was reported. */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SOURCE_FILE", INT2FIX(PG_DIAG_SOURCE_FILE));
 
-	/* #result_error_field argument constant: The line number of the
-	 * source-code location where the error was reported. */
+	/* Result#result_error_field argument constant
+	 *
+	 * The line number of the source-code location where the error was reported. */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SOURCE_LINE", INT2FIX(PG_DIAG_SOURCE_LINE));
 
-	/* #result_error_field argument constant: The name of the source-code
-	 * function reporting the error. */
+	/* Result#result_error_field argument constant
+	 *
+	 * The name of the source-code function reporting the error. */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SOURCE_FUNCTION", INT2FIX(PG_DIAG_SOURCE_FUNCTION));
+
+#ifdef PG_DIAG_TABLE_NAME
+	/* Result#result_error_field argument constant
+	 *
+	 * If the error was associated with a specific database object, the name of the schema containing that object, if any. */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_SCHEMA_NAME", INT2FIX(PG_DIAG_SCHEMA_NAME));
+
+	/* Result#result_error_field argument constant
+	 *
+	 * If the error was associated with a specific table, the name of the table.
+	 * (When this field is present, the schema name field provides the name of the table's schema.) */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_TABLE_NAME", INT2FIX(PG_DIAG_TABLE_NAME));
+
+	/* Result#result_error_field argument constant
+	 *
+	 * If the error was associated with a specific table column, the name of the column.
+	 * (When this field is present, the schema and table name fields identify the table.) */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_COLUMN_NAME", INT2FIX(PG_DIAG_COLUMN_NAME));
+
+	/* Result#result_error_field argument constant
+	 *
+	 * If the error was associated with a specific datatype, the name of the datatype.
+	 * (When this field is present, the schema name field provides the name of the datatype's schema.) */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_DATATYPE_NAME", INT2FIX(PG_DIAG_DATATYPE_NAME));
+
+	/* Result#result_error_field argument constant
+	 *
+	 * If the error was associated with a specific constraint, the name of the constraint.
+	 * The table or domain that the constraint belongs to is reported using the fields listed above.
+	 * (For this purpose, indexes are treated as constraints, even if they weren't created with constraint syntax.) */
+	rb_define_const(rb_mPGconstants, "PG_DIAG_CONSTRAINT_NAME", INT2FIX(PG_DIAG_CONSTRAINT_NAME));
+#endif
 
 	/* Invalid OID constant */
 	rb_define_const(rb_mPGconstants, "INVALID_OID", INT2FIX(InvalidOid));
@@ -513,13 +652,26 @@ Init_pg_ext()
 	/* Add the constants to the toplevel namespace */
 	rb_include_module( rb_mPG, rb_mPGconstants );
 
-#ifdef M17N_SUPPORTED
 	enc_pg2ruby = st_init_numtable();
-	s_id_index = rb_intern("@encoding");
-#endif
 
 	/* Initialize the main extension classes */
 	init_pg_connection();
 	init_pg_result();
+	init_pg_errors();
+	init_pg_type_map();
+	init_pg_type_map_all_strings();
+	init_pg_type_map_by_class();
+	init_pg_type_map_by_column();
+	init_pg_type_map_by_mri_type();
+	init_pg_type_map_by_oid();
+	init_pg_type_map_in_ruby();
+	init_pg_coder();
+	init_pg_text_encoder();
+	init_pg_text_decoder();
+	init_pg_binary_encoder();
+	init_pg_binary_decoder();
+	init_pg_copycoder();
+	init_pg_recordcoder();
+	init_pg_tuple();
 }
 
