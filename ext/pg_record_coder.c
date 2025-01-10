@@ -43,11 +43,11 @@ static const rb_data_type_t pg_recordcoder_type = {
 		pg_recordcoder_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_recordcoder_memsize,
-		pg_compact_callback(pg_recordcoder_compact),
+		pg_recordcoder_compact,
 	},
 	&pg_coder_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -56,7 +56,7 @@ pg_recordcoder_encoder_allocate( VALUE klass )
 	t_pg_recordcoder *this;
 	VALUE self = TypedData_Make_Struct( klass, t_pg_recordcoder, &pg_recordcoder_type, this );
 	pg_coder_init_encoder( self );
-	this->typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap, pg_typemap_all_strings);
 	return self;
 }
 
@@ -66,7 +66,7 @@ pg_recordcoder_decoder_allocate( VALUE klass )
 	t_pg_recordcoder *this;
 	VALUE self = TypedData_Make_Struct( klass, t_pg_recordcoder, &pg_recordcoder_type, this );
 	pg_coder_init_decoder( self );
-	this->typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap, pg_typemap_all_strings);
 	return self;
 }
 
@@ -86,11 +86,12 @@ pg_recordcoder_type_map_set(VALUE self, VALUE type_map)
 {
 	t_pg_recordcoder *this = RTYPEDDATA_DATA( self );
 
+	rb_check_frozen(self);
 	if ( !rb_obj_is_kind_of(type_map, rb_cTypeMap) ){
 		rb_raise( rb_eTypeError, "wrong elements type %s (expected some kind of PG::TypeMap)",
 				rb_obj_classname( type_map ) );
 	}
-	this->typemap = type_map;
+	RB_OBJ_WRITE(self, &this->typemap, type_map);
 
 	return type_map;
 }
@@ -134,7 +135,7 @@ pg_recordcoder_type_map_get(VALUE self)
  *   tm = PG::TypeMapByColumn.new([PG::TextEncoder::Float.new]*2)
  *   # Use this type map to encode the record:
  *   PG::TextEncoder::Record.new(type_map: tm).encode([1,2])
- *   # => "(\"1.0000000000000000E+00\",\"2.0000000000000000E+00\")"
+ *   # => "(\"1.0\",\"2.0\")"
  *
  * Records can also be encoded and decoded directly to and from the database.
  * This avoids intermediate string allocations and is very fast.
@@ -197,7 +198,7 @@ pg_text_enc_record(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate
 		char *ptr1;
 		char *ptr2;
 		long strlen;
-		int backslashs;
+		int backslashes;
 		VALUE subint;
 		VALUE entry;
 
@@ -248,19 +249,19 @@ pg_text_enc_record(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate
 					ptr2 = current_out + strlen;
 
 					/* count required backlashs */
-					for(backslashs = 0; ptr1 != ptr2; ptr1++) {
+					for(backslashes = 0; ptr1 != ptr2; ptr1++) {
 						/* Escape backslash itself, newline, carriage return, and the current delimiter character. */
 						if(*ptr1 == '"' || *ptr1 == '\\'){
-							backslashs++;
+							backslashes++;
 						}
 					}
 
 					ptr1 = current_out + strlen;
-					ptr2 = current_out + strlen + backslashs;
+					ptr2 = current_out + strlen + backslashes;
 					current_out = ptr2;
 
 					/* Then store the escaped string on the final position, walking
-					 * right to left, until all backslashs are placed. */
+					 * right to left, until all backslashes are placed. */
 					while( ptr1 != ptr2 ) {
 						*--ptr2 = *--ptr1;
 						if(*ptr1 == '"' || *ptr1 == '\\'){
@@ -339,15 +340,17 @@ record_isspace(char ch)
  *   conn.exec("SELECT * FROM my_table").map_types!(PG::TypeMapByColumn.new([deco]*2)).to_a
  *   # => [{"v1"=>[2.0, 3.0], "v2"=>[4.0, 5.0]}, {"v1"=>[6.0, 7.0], "v2"=>[8.0, 9.0]}]
  *
- * It's more very convenient to use the PG::BasicTypeRegistry, which is based on database OIDs.
+ * It's more convenient to use the PG::BasicTypeRegistry, which is based on database OIDs.
  *   # Fetch a NULL record of our type to retrieve the OIDs of the two fields "r" and "i"
  *   oids = conn.exec( "SELECT (NULL::complex).*" )
  *   # Build a type map (PG::TypeMapByColumn) for decoding the "complex" type
  *   dtm = PG::BasicTypeMapForResults.new(conn).build_column_map( oids )
- *   # Register a record decoder for decoding our type "complex"
- *   PG::BasicTypeRegistry.register_coder(PG::TextDecoder::Record.new(type_map: dtm, name: "complex"))
- *   # Apply the basic type registry to all results retrieved from the server
- *   conn.type_map_for_results = PG::BasicTypeMapForResults.new(conn)
+ *   # Build a type map and populate with basic types
+ *   btr = PG::BasicTypeRegistry.new.register_default_types
+ *   # Register a new record decoder for decoding our type "complex"
+ *   btr.register_coder(PG::TextDecoder::Record.new(type_map: dtm, name: "complex"))
+ *   # Apply our basic type registry to all results retrieved from the server
+ *   conn.type_map_for_results = PG::BasicTypeMapForResults.new(conn, registry: btr)
  *   # Now queries decode the "complex" type (and many basic types) automatically
  *   conn.exec("SELECT * FROM my_table").to_a
  *   # => [{"v1"=>[2.0, 3.0], "v2"=>[4.0, 5.0]}, {"v1"=>[6.0, 7.0], "v2"=>[8.0, 9.0]}]
@@ -492,7 +495,7 @@ pg_text_dec_record(t_pg_coder *conv, char *input_line, int len, int _tuple, int 
 
 
 void
-init_pg_recordcoder()
+init_pg_recordcoder(void)
 {
 	/* Document-class: PG::RecordCoder < PG::Coder
 	 *

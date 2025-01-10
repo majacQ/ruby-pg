@@ -22,7 +22,7 @@ require 'pg' unless defined?( PG )
 #   end
 #
 #   conn = PG.connect
-#   regi = PG::BasicTypeRegistry.new.define_default_types
+#   regi = PG::BasicTypeRegistry.new.register_default_types
 #   regi.register_type(0, 'inet', InetEncoder, InetDecoder)
 #   conn.type_map_for_results = PG::BasicTypeMapForResults.new(conn, registry: regi)
 class PG::BasicTypeRegistry
@@ -39,7 +39,8 @@ class PG::BasicTypeRegistry
 			oid
 			bool
 			date timestamp timestamptz
-		].inject({}){|h,e| h[e] = true; h }
+		].inject({}){|h,e| h[e] = true; h }.freeze
+		private_constant :DONT_QUOTE_TYPES
 
 		def initialize(result, coders_by_name, format, arraycoder)
 			coder_map = {}
@@ -52,7 +53,7 @@ class PG::BasicTypeRegistry
 				coder.oid = row['oid'].to_i
 				coder.name = row['typname']
 				coder.format = format
-				coder_map[coder.oid] = coder
+				coder_map[coder.oid] = coder.freeze
 			end
 
 			if arraycoder
@@ -67,13 +68,14 @@ class PG::BasicTypeRegistry
 					coder.format = format
 					coder.elements_type = elements_coder
 					coder.needs_quotation = !DONT_QUOTE_TYPES[elements_coder.name]
-					coder_map[coder.oid] = coder
+					coder_map[coder.oid] = coder.freeze
 				end
 			end
 
-			@coders = coder_map.values
-			@coders_by_name = @coders.inject({}){|h, t| h[t.name] = t; h }
-			@coders_by_oid = @coders.inject({}){|h, t| h[t.oid] = t; h }
+			@coders = coder_map.values.freeze
+			@coders_by_name = @coders.inject({}){|h, t| h[t.name] = t; h }.freeze
+			@coders_by_oid = @coders.inject({}){|h, t| h[t.oid] = t; h }.freeze
+			freeze
 		end
 
 		attr_reader :coders
@@ -117,19 +119,24 @@ class PG::BasicTypeRegistry
 				JOIN pg_proc as ti ON ti.oid = t.typinput
 			SQL
 
+			init_maps(registry, result.freeze)
+			freeze
+		end
+
+		private def init_maps(registry, result)
 			@maps = [
 				[0, :encoder, PG::TextEncoder::Array],
 				[0, :decoder, PG::TextDecoder::Array],
-				[1, :encoder, nil],
-				[1, :decoder, nil],
+				[1, :encoder, PG::BinaryEncoder::Array],
+				[1, :decoder, PG::BinaryDecoder::Array],
 			].inject([]) do |h, (format, direction, arraycoder)|
 				coders = registry.coders_for(format, direction) || {}
 				h[format] ||= {}
 				h[format][direction] = CoderMap.new(result, coders, format, arraycoder)
 				h
-			end
+			end.each{|h| h.freeze }.freeze
 
-			@typenames_by_oid = result.inject({}){|h, t| h[t['oid'].to_i] = t['typname']; h }
+			@typenames_by_oid = result.inject({}){|h, t| h[t['oid'].to_i] = t['typname']; h }.freeze
 		end
 
 		def each_format(direction)
@@ -142,8 +149,9 @@ class PG::BasicTypeRegistry
 	end
 
 	module Checker
-		ValidFormats = { 0 => true, 1 => true }
-		ValidDirections = { :encoder => true, :decoder => true }
+		ValidFormats = { 0 => true, 1 => true }.freeze
+		ValidDirections = { :encoder => true, :decoder => true }.freeze
+		private_constant :ValidFormats, :ValidDirections
 
 		protected def check_format_and_direction(format, direction)
 			raise(ArgumentError, "Invalid format value %p" % format) unless ValidFormats[format]
@@ -155,15 +163,22 @@ class PG::BasicTypeRegistry
 				raise ArgumentError, "registry argument must be given to CoderMapsBundle" if registry
 				conn_or_maps
 			else
-				PG::BasicTypeRegistry::CoderMapsBundle.new(conn_or_maps, registry: registry)
+				PG::BasicTypeRegistry::CoderMapsBundle.new(conn_or_maps, registry: registry).freeze
 			end
 		end
 	end
 
 	include Checker
 
-  def initialize
-		# The key of these hashs maps to the `typname` column from the table pg_type.
+	def initialize
+		# @coders_by_name has a content of
+		#    Array< Hash< Symbol: Hash< String: Coder > > >
+		#
+		# The layers are:
+		#   * index of Array is 0 (text) and 1 (binary)
+		#   * Symbol key in the middle Hash is :encoder and :decoder
+		#   * String key in the inner Hash corresponds to the `typname` column in the table pg_type
+		#   * Coder value in the inner Hash is the associated coder object
 		@coders_by_name = []
 	end
 
@@ -184,6 +199,7 @@ class PG::BasicTypeRegistry
 		name = coder.name || raise(ArgumentError, "name of #{coder.inspect} must be defined")
 		h[:encoder][name] = coder if coder.respond_to?(:encode)
 		h[:decoder][name] = coder if coder.respond_to?(:decode)
+		self
 	end
 
 	# Register the given +encoder_class+ and/or +decoder_class+ for casting a PostgreSQL type.
@@ -191,8 +207,9 @@ class PG::BasicTypeRegistry
 	# +name+ must correspond to the +typname+ column in the +pg_type+ table.
 	# +format+ can be 0 for text format and 1 for binary.
 	def register_type(format, name, encoder_class, decoder_class)
-		register_coder(encoder_class.new(name: name, format: format)) if encoder_class
-		register_coder(decoder_class.new(name: name, format: format)) if decoder_class
+		register_coder(encoder_class.new(name: name, format: format).freeze) if encoder_class
+		register_coder(decoder_class.new(name: name, format: format).freeze) if decoder_class
+		self
 	end
 
 	# Alias the +old+ type to the +new+ type.
@@ -205,16 +222,21 @@ class PG::BasicTypeRegistry
 				@coders_by_name[format][ende].delete(new)
 			end
 		end
+		self
 	end
 
 	# Populate the registry with all builtin types of ruby-pg
-	def define_default_types
+	def register_default_types
 		register_type 0, 'int2', PG::TextEncoder::Integer, PG::TextDecoder::Integer
 		alias_type    0, 'int4', 'int2'
 		alias_type    0, 'int8', 'int2'
 		alias_type    0, 'oid',  'int2'
 
-		register_type 0, 'numeric', PG::TextEncoder::Numeric, PG::TextDecoder::Numeric
+		begin
+			PG.require_bigdecimal_without_warning
+			register_type 0, 'numeric', PG::TextEncoder::Numeric, PG::TextDecoder::Numeric
+		rescue LoadError
+		end
 		register_type 0, 'text', PG::TextEncoder::String, PG::TextDecoder::String
 		alias_type 0, 'varchar', 'text'
 		alias_type 0, 'char', 'text'
@@ -229,9 +251,7 @@ class PG::BasicTypeRegistry
 		# alias_type 'uuid',     'text'
 		#
 		# register_type 'money', OID::Money.new
-		# There is no PG::TextEncoder::Bytea, because it's simple and more efficient to send bytea-data
-		# in binary format, either with PG::BinaryEncoder::Bytea or in Hash param format.
-		register_type 0, 'bytea', nil, PG::TextDecoder::Bytea
+		register_type 0, 'bytea', PG::TextEncoder::Bytea, PG::TextDecoder::Bytea
 		register_type 0, 'bool', PG::TextEncoder::Boolean, PG::TextDecoder::Boolean
 		# register_type 'bit', OID::Bit.new
 		# register_type 'varbit', OID::Bit.new
@@ -239,6 +259,7 @@ class PG::BasicTypeRegistry
 		register_type 0, 'float4', PG::TextEncoder::Float, PG::TextDecoder::Float
 		alias_type 0, 'float8', 'float4'
 
+		# For compatibility reason the timestamp in text format is encoded as local time (TimestampWithoutTimeZone) instead of UTC
 		register_type 0, 'timestamp', PG::TextEncoder::TimestampWithoutTimeZone, PG::TextDecoder::TimestampWithoutTimeZone
 		register_type 0, 'timestamptz', PG::TextEncoder::TimestampWithTimeZone, PG::TextDecoder::TimestampWithTimeZone
 		register_type 0, 'date', PG::TextEncoder::Date, PG::TextDecoder::Date
@@ -257,6 +278,7 @@ class PG::BasicTypeRegistry
 		register_type 0, 'inet', PG::TextEncoder::Inet, PG::TextDecoder::Inet
 		alias_type 0, 'cidr', 'inet'
 
+		register_type 0, 'record', PG::TextEncoder::Record, PG::TextDecoder::Record
 
 
 		register_type 1, 'int2', PG::BinaryEncoder::Int2, PG::BinaryDecoder::Integer
@@ -273,24 +295,17 @@ class PG::BasicTypeRegistry
 
 		register_type 1, 'bytea', PG::BinaryEncoder::Bytea, PG::BinaryDecoder::Bytea
 		register_type 1, 'bool', PG::BinaryEncoder::Boolean, PG::BinaryDecoder::Boolean
-		register_type 1, 'float4', nil, PG::BinaryDecoder::Float
-		register_type 1, 'float8', nil, PG::BinaryDecoder::Float
-		register_type 1, 'timestamp', nil, PG::BinaryDecoder::TimestampUtc
-		register_type 1, 'timestamptz', nil, PG::BinaryDecoder::TimestampUtcToLocal
+		register_type 1, 'float4', PG::BinaryEncoder::Float4, PG::BinaryDecoder::Float
+		register_type 1, 'float8', PG::BinaryEncoder::Float8, PG::BinaryDecoder::Float
+		register_type 1, 'timestamp', PG::BinaryEncoder::TimestampUtc, PG::BinaryDecoder::TimestampUtc
+		register_type 1, 'timestamptz', PG::BinaryEncoder::TimestampUtc, PG::BinaryDecoder::TimestampUtcToLocal
+		register_type 1, 'date', PG::BinaryEncoder::Date, PG::BinaryDecoder::Date
 
 		self
 	end
 
-	# @private
-	DEFAULT_TYPE_REGISTRY = PG::BasicTypeRegistry.new.define_default_types
+	alias define_default_types register_default_types
 
-	# Delegate class method calls to DEFAULT_TYPE_REGISTRY
-	class << self
-		%i[ register_coder register_type alias_type ].each do |meth|
-			define_method(meth) do |*args|
-				warn "PG::BasicTypeRegistry.#{meth} is deprecated. Please use your own instance by PG::BasicTypeRegistry.new instead!"
-				DEFAULT_TYPE_REGISTRY.send(meth, *args)
-			end
-		end
-	end
+	DEFAULT_TYPE_REGISTRY = PG.make_shareable(PG::BasicTypeRegistry.new.register_default_types)
+	private_constant :DEFAULT_TYPE_REGISTRY
 end

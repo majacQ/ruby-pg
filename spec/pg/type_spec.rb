@@ -3,8 +3,10 @@
 
 require 'pg'
 require 'time'
-require 'objspace'
-
+unless defined?(ObjectSpace.memsize_of)
+	require "objspace"
+	DATA_OBJ_MEMSIZE = ObjectSpace.memsize_of(Object.new)
+end
 
 describe "PG::Type derivations" do
 	let!(:textenc_int) { PG::TextEncoder::Integer.new name: 'Integer', oid: 23 }
@@ -13,7 +15,12 @@ describe "PG::Type derivations" do
 	let!(:textdec_boolean) { PG::TextDecoder::Boolean.new }
 	let!(:textenc_float) { PG::TextEncoder::Float.new }
 	let!(:textdec_float) { PG::TextDecoder::Float.new }
-	let!(:textenc_numeric) { PG::TextEncoder::Numeric.new }
+	let!(:textenc_numeric) do
+		begin
+			PG::TextEncoder::Numeric.new
+		rescue LoadError
+		end
+	end
 	let!(:textenc_string) { PG::TextEncoder::String.new }
 	let!(:textdec_string) { PG::TextDecoder::String.new }
 	let!(:textenc_timestamp) { PG::TextEncoder::TimestampWithoutTimeZone.new }
@@ -28,7 +35,10 @@ describe "PG::Type derivations" do
 	let!(:binaryenc_int2) { PG::BinaryEncoder::Int2.new }
 	let!(:binaryenc_int4) { PG::BinaryEncoder::Int4.new }
 	let!(:binaryenc_int8) { PG::BinaryEncoder::Int8.new }
+	let!(:binarydec_string) { PG::BinaryDecoder::String.new }
 	let!(:binarydec_integer) { PG::BinaryDecoder::Integer.new }
+	let!(:binaryenc_timestamputc) { PG::BinaryEncoder::TimestampUtc.new }
+	let!(:binaryenc_timestamplocal) { PG::BinaryEncoder::TimestampLocal.new }
 
 	let!(:intenc_incrementer) do
 		Class.new(PG::SimpleEncoder) do
@@ -364,7 +374,7 @@ describe "PG::Type derivations" do
 				expect( textenc_float.encode(-Float::NAN) ).to eq( Float::NAN.to_s )
 			end
 
-			it "should encode various inputs to numeric format" do
+			it "should encode various inputs to numeric format", :bigdecimal do
 				expect( textenc_numeric.encode(0) ).to eq( "0" )
 				expect( textenc_numeric.encode(1) ).to eq( "1" )
 				expect( textenc_numeric.encode(-12345678901234567890123) ).to eq( "-12345678901234567890123" )
@@ -382,7 +392,7 @@ describe "PG::Type derivations" do
 				expect( textenc_bytea.encode("\x00\x01\x02\x03\xef".b) ).to eq( "\\x00010203ef" )
 			end
 
-			context 'timestamps' do
+			context 'text timestamps' do
 				it 'encodes timestamps without timezone' do
 					expect( textenc_timestamp.encode(Time.new(2016,1,2, 23, 23, 59.123456, 3*60*60)) ).
 						to match( /^2016-01-02 23:23:59.12345\d+$/ )
@@ -400,6 +410,21 @@ describe "PG::Type derivations" do
 						to match( /^2016-01-02 23:23:59.12345\d+ \-04:00$/ )
 					expect( textenc_timestamptz.encode(Time.new(2016,8,02, 23, 23, 59.123456, 10*60*60)) ).
 						to match( /^2016-08-02 23:23:59.12345\d+ \+10:00$/ )
+				end
+			end
+
+			context 'binary timestamps' do
+				it 'encodes timestamps as UTC' do
+					expect( binaryenc_timestamputc.encode(Time.utc(2000,1,1)) ).
+						to eq( "\x00" * 8 )
+					expect( binaryenc_timestamputc.encode(Time.utc(2000,1,1).localtime) ).
+						to eq( "\x00" * 8 )
+				end
+				it 'encodes timestamps as local time' do
+					expect( binaryenc_timestamplocal.encode(Time.new(2000,1,1)) ).
+						to eq( "\x00" * 8 )
+					expect( binaryenc_timestamplocal.encode(Time.new(2000,1,1).utc) ).
+						to eq( "\x00" * 8 )
 				end
 			end
 
@@ -491,9 +516,98 @@ describe "PG::Type derivations" do
 			expect( t.name ).to be_nil
 		end
 
-		it "should overwrite default values" do
+		it "should overwrite default values as kwargs" do
 			t = PG::BinaryEncoder::Int4.new(format: 0)
 			expect( t.format ).to eq( 0 )
+		end
+
+		def expect_deprecated_coder_init
+			if RUBY_VERSION >= '3'
+				begin
+					prev_deprecated = Warning[:deprecated]
+					Warning[:deprecated] = true
+
+					expect do
+						yield
+					end.to output(/deprecated.*type_spec.rb/).to_stderr
+				ensure
+					Warning[:deprecated] = prev_deprecated
+				end
+			else
+				yield
+			end
+		end
+
+		it "should overwrite default format" do
+			t = nil
+			expect_deprecated_coder_init do
+				t = PG::BinaryEncoder::Int4.new({format: 0})
+			end
+			expect( t.format ).to eq( 0 )
+
+			t = PG::BinaryEncoder::Int4.new(format: 0)
+			expect( t.format ).to eq( 0 )
+		end
+
+		it "should take hash argument" do
+			t = nil
+			expect_deprecated_coder_init { t = PG::TextEncoder::Integer.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryEncoder::Int4.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryDecoder::TimestampUtc.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryDecoder::TimestampUtcToLocal.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryDecoder::TimestampLocal.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryEncoder::TimestampUtc.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::BinaryEncoder::TimestampLocal.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::TextDecoder::TimestampUtc.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::TextDecoder::TimestampUtcToLocal.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::TextDecoder::TimestampLocal.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::TextDecoder::TimestampWithoutTimeZone.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+			expect_deprecated_coder_init { t = PG::TextDecoder::TimestampWithTimeZone.new({name: "abcä"}) }
+			expect( t.name ).to eq( "abcä" )
+		end
+
+		it "shouldn't overwrite timestamp flags" do
+			t = PG::TextDecoder::TimestampUtc.new({flags: PG::Coder::TIMESTAMP_DB_LOCAL})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_UTC | PG::Coder::TIMESTAMP_APP_UTC )
+			t = PG::TextDecoder::TimestampUtcToLocal.new({flags: PG::Coder::TIMESTAMP_APP_UTC})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_UTC | PG::Coder::TIMESTAMP_APP_LOCAL )
+			t = PG::TextDecoder::TimestampLocal.new({flags: PG::Coder::TIMESTAMP_DB_UTC})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_LOCAL | PG::Coder::TIMESTAMP_APP_LOCAL )
+
+			t = PG::BinaryDecoder::TimestampUtc.new({flags: PG::Coder::TIMESTAMP_DB_LOCAL})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_UTC | PG::Coder::TIMESTAMP_APP_UTC )
+			t = PG::BinaryDecoder::TimestampUtcToLocal.new({flags: PG::Coder::TIMESTAMP_APP_UTC})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_UTC | PG::Coder::TIMESTAMP_APP_LOCAL )
+			t = PG::BinaryDecoder::TimestampLocal.new({flags: PG::Coder::TIMESTAMP_DB_UTC})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_LOCAL | PG::Coder::TIMESTAMP_APP_LOCAL )
+
+			t = PG::BinaryEncoder::TimestampUtc.new({flags: PG::Coder::TIMESTAMP_DB_LOCAL})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_UTC )
+			t = PG::BinaryEncoder::TimestampLocal.new({flags: PG::Coder::TIMESTAMP_APP_LOCAL})
+			expect( t.flags ).to eq( PG::Coder::TIMESTAMP_DB_LOCAL )
+		end
+
+		it "should deny changes when frozen" do
+			t = PG::TextEncoder::String.new.freeze
+			expect{ t.format = 1 }.to raise_error(FrozenError)
+			expect{ t.oid = 0  }.to raise_error(FrozenError)
+			expect{ t.name = "x" }.to raise_error(FrozenError)
+		end
+
+		it "should be shareable for Ractor", :ractor do
+			t = PG::TextEncoder::String.new.freeze
+			Ractor.make_shareable(t)
 		end
 
 		it "should give account about memory usage" do
@@ -516,6 +630,9 @@ describe "PG::Type derivations" do
 			let!(:textenc_string_array_with_delimiter) { PG::TextEncoder::Array.new elements_type: textenc_string, delimiter: ';' }
 			let!(:textdec_string_array_with_delimiter) { PG::TextDecoder::Array.new elements_type: textdec_string, delimiter: ';' }
 			let!(:textdec_bytea_array) { PG::TextDecoder::Array.new elements_type: textdec_bytea }
+			let!(:binarydec_array) { PG::BinaryDecoder::Array.new }
+			let!(:binarydec_int_array) { PG::BinaryDecoder::Array.new elements_type: PG::BinaryDecoder::Integer.new }
+			let!(:binaryenc_array) { PG::BinaryEncoder::Array.new }
 
 			#
 			# Array parser specs are thankfully borrowed from here:
@@ -524,8 +641,14 @@ describe "PG::Type derivations" do
 			describe '#decode' do
 				context 'one dimensional arrays' do
 					context 'empty' do
-						it 'returns an empty array' do
+						it 'returns an empty array from text' do
 							expect( textdec_string_array.decode(%[{}]) ).to eq( [] )
+						end
+
+						it 'returns an empty array from binary' do
+							# binary '{}'::TEXT[]
+							b = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19"
+							expect( binarydec_array.decode(b) ).to eq( [] )
 						end
 					end
 
@@ -600,7 +723,7 @@ describe "PG::Type derivations" do
 								expect( textdec_string_array.decode(%({1,2,3}x)) ).to eq(['1','2','3'])
 								expect( textdec_string_array.decode(%({{1,2},{2,3})) ).to eq([['1','2'],['2','3']])
 								expect( textdec_string_array.decode(%({{1,2},{2,3}}x)) ).to eq([['1','2'],['2','3']])
-								expect( textdec_string_array.decode(%({[1,2},{2,3}}})) ).to eq(['[1','2'])
+								expect( textdec_string_array.decode(%({[1,2},{2,3}}})) ).to eq(["[1",'2'])
 							end
 						end
 
@@ -652,11 +775,11 @@ describe "PG::Type derivations" do
 						it 'returns an array of strings with a sub array and a quoted }' do
 							expect( textdec_string_array.decode(%[{1,{"2,}3",NULL},4}]) ).to eq( ['1',['2,}3',nil],'4'] )
 						end
-						it 'returns an array of strings with a sub array and a quoted {' do
-							expect( textdec_string_array.decode(%[{1,{"2,{3"},4}]) ).to eq( ['1',['2,{3'],'4'] )
+						it "returns an array of strings with a sub array and a quoted {" do
+							expect( textdec_string_array.decode(%[{1,{"2,{3"},4}]) ).to eq( ['1',["2,{3"],'4'] )
 						end
-						it 'returns an array of strings with a sub array and a quoted { and escaped quote' do
-							expect( textdec_string_array.decode(%[{1,{"2\\",{3"},4}]) ).to eq( ['1',['2",{3'],'4'] )
+						it "returns an array of strings with a sub array and a quoted { and escaped quote" do
+							expect( textdec_string_array.decode(%[{1,{"2\\",{3"},4}]) ).to eq( ['1',["2\",{3"],'4'] )
 						end
 						it 'returns an array of strings with a sub array with empty strings' do
 							expect( textdec_string_array.decode(%[{1,{""},4,{""}}]) ).to eq( ['1',[''],'4',['']] )
@@ -678,6 +801,94 @@ describe "PG::Type derivations" do
 					end
 					it 'returns an array of strings with sub arrays' do
 						expect( textdec_string_array.decode(%[{1,{2,{3,4}},{NULL,6},7}]) ).to eq( ['1',['2',['3','4']],[nil,'6'],'7'] )
+					end
+
+					# '[-1:1][-2:-2][-3:-2]={{{5,6}},{{6,7}},{{NULL,5}}}'::INT[]
+					let!(:bin_int_array_data) do
+						[	"00000003" + "00000001" + "00000017" +
+							"00000003" + "ffffffff" +
+							"00000001" + "fffffffe" +
+							"00000002" + "fffffffd" +
+							"00000004" + "00000005" +
+							"00000004" + "00000006" +
+							"00000004" + "00000006" +
+							"00000004" + "00000007" +
+							"ffffffff" +
+							"00000004" + "00000005"
+						].pack("H*")
+					end
+
+					# '[-1:1][-2:-2][-3:-2]={{{5,6"}},{{6,7}},{{5,NULL}}}'::TEXT[]
+					let!(:bin_text_array_data) do
+						[	"00000003" + "00000001" + "00000019" +
+							"00000003" + "ffffffff" +
+							"00000001" + "fffffffe" +
+							"00000002" + "fffffffd" +
+							"00000001" + "35" +
+							"00000001" + "36" +
+							"00000002" + "3622" +
+							"00000001" + "37" +
+							"ffffffff" +
+							"00000001" + "35"
+						].pack("H*")
+					end
+
+					it 'can decode binary int[]' do
+						expect( binarydec_int_array.decode(bin_int_array_data) ).to eq( [[[5, 6]], [[6, 7]], [[nil, 5]]] )
+					end
+					it 'can decode binary text[]' do
+						expect( binarydec_array.decode(bin_text_array_data) ).to eq( [[["5", "6"]], [["6\"", "7"]], [[nil, "5"]]] )
+					end
+					it 'can decode binary text[] with 6 dimensions' do
+						d = ["00000006" + "00000001" + "00000019" +
+							"00000001" + "ffffffff" +
+							"00000001" + "fffffffe" +
+							"00000001" + "fffffffd" +
+							"00000001" + "ffffffff" +
+							"00000001" + "fffffffe" +
+							"00000001" + "fffffffd" +
+							"ffffffff"
+						].pack("H*")
+						expect( binarydec_array.decode(d) ).to eq( [[[[[[nil]]]]]] )
+					end
+					it 'raises error when binary array is incomplete' do
+						(0 ... bin_int_array_data.bytesize).each do |i|
+							expect do
+								binarydec_int_array.decode(bin_int_array_data[0, i])
+							end.to raise_error(ArgumentError, /premature/)
+						end
+					end
+					it 'raises error when binary array has additonal bytes' do
+						expect do
+							binarydec_int_array.decode(bin_int_array_data + "\0")
+						end.to raise_error(ArgumentError, /trailing/)
+					end
+					it 'raises error when binary array has too many dimensions' do
+						d = ["00000007" + "00000001" + "00000019"].pack("H*")
+						expect do
+							binarydec_int_array.decode(d)
+						end.to raise_error(ArgumentError, /dimensions/)
+					end
+					it 'raises error when binary array has invalid dimensions' do
+						d = ["ffffffff" + "00000001" + "00000019"].pack("H*")
+						expect do
+							binarydec_int_array.decode(d)
+						end.to raise_error(ArgumentError, /dimensions/)
+					end
+					it 'raises error when binary array has invalid flags' do
+						d = ["00000000" + "00000002" + "00000019"].pack("H*")
+						expect do
+							binarydec_int_array.decode(d)
+						end.to raise_error(ArgumentError, /flags/)
+					end
+					it 'raises error when binary array has invalid flags' do
+						d = ["00000002" + "00000000" + "00000019" +
+								 "00010000" + "ffffffff" +
+								 "00010000" + "fffffffe"
+						    ].pack("H*")
+						expect do
+							binarydec_int_array.decode(d)
+						end.to raise_error(ArgumentError, /array size/)
 					end
 				end
 
@@ -709,13 +920,113 @@ describe "PG::Type derivations" do
 					it 'encodes an array of float8 with sub arrays' do
 						expect( textenc_float_array.encode([1000.11,[-0.00000221,[3.31,-441]],[nil,6.61],-7.71]) ).to match(Regexp.new(%[^{1000.1*,{-2.2*e-*6,{3.3*,-441.0}},{NULL,6.6*},-7.7*}$].gsub(/([\.\+\{\}\,])/, "\\\\\\1").gsub(/\*/, "\\d*")))
 					end
+
+					let!(:binaryenc_int4_array) { PG::BinaryEncoder::Array.new elements_type: PG::BinaryEncoder::Int4.new(oid: 0x17) }
+
+					it 'encodes an array of int4 with sub arrays' do
+						exp = ["00000003" + "00000001" + "00000017" +
+							"00000003" + "00000001" +
+							"00000001" + "00000001" +
+							"00000002" + "00000001" +
+							"00000004" + "00000005" +
+							"00000004" + "00000006" +
+							"00000004" + "00000006" +
+							"00000004" + "00000007" +
+							"ffffffff" +
+							"00000004" + "00000005"
+						].pack("H*")
+
+						expect( binaryenc_int4_array.encode([[[5,6]],[[6,7]],[[nil,5]]]) ).to eq( exp )
+					end
+
+					let!(:binaryenc_text_array) { PG::BinaryEncoder::Array.new elements_type: PG::BinaryEncoder::String.new(oid: 0x19) }
+
+					it 'encodes an array of text with sub arrays' do
+						exp =["00000003" + "00000001" + "00000019" +
+							"00000003" + "00000001" +
+							"00000001" + "00000001" +
+							"00000002" + "00000001" +
+							"00000001" + "35" +
+							"00000001" + "36" +
+							"00000002" + "3622" +
+							"00000001" + "37" +
+							"ffffffff" +
+							"00000001" + "35"
+						].pack("H*")
+
+						expect( binaryenc_text_array.encode([[[5,6]],[["6\"",7]],[[nil,5]]]) ).to eq( exp )
+					end
+
+					let!(:binaryenc_array_array) { PG::BinaryEncoder::Array.new elements_type: PG::BinaryEncoder::Array.new(elements_type: PG::BinaryEncoder::Int4.new(oid: 0x17), dimensions: 1), dimensions: 2 }
+
+					it 'encodes an array in an array of int4' do
+						exp = ["00000002" + "00000001" + "00000000" +
+						      "00000003" + "00000001" + "00000001" + "00000001" +
+
+						      "00000024" +
+						      "00000001" + "00000001" + "00000017" +
+						      "00000002" + "00000001" +
+						      "00000004" + "00000005" +
+						      "00000004" + "00000006" +
+
+						      "00000024" +
+						      "00000001" + "00000001" + "00000017" +
+						      "00000002" + "00000001" +
+						      "00000004" + "00000006" +
+						      "00000004" + "00000007" +
+
+						      "00000020" +
+						      "00000001" + "00000001" + "00000017" +
+						      "00000002" + "00000001" +
+						      "ffffffff" +
+						      "00000004" + "00000005"
+						      ].pack("H*")
+
+						expect( binaryenc_array_array.encode([[[5,6]],[[6,7]],[[nil,5]]]) ).to eq( exp )
+					end
 				end
+
 				context 'two dimensional arrays' do
 					it 'encodes an array of timestamps with sub arrays' do
 						expect( textenc_timestamp_array.encode([Time.new(2014,12,31),[nil, Time.new(2016,01,02, 23, 23, 59.99)]]) ).
 								to eq( %[{2014-12-31 00:00:00.000000000,{NULL,2016-01-02 23:23:59.990000000}}] )
 					end
+
+					context 'with dimensions' do
+						let!(:textenc_array_2dim) { textenc_string_array.dup.tap{|a| a.dimensions = 2} }
+						let!(:binaryenc_array_2dim) { binaryenc_array.dup.tap{|a| a.dimensions = 2} }
+
+						it 'encodes binary int array' do
+							binaryenc_array_2dim.encode([[1]])
+						end
+						it 'encodes text int array' do
+							expect( textenc_array_2dim.encode([[1]]) ).to eq( "{{1}}" )
+						end
+						it 'encodes empty array' do
+							binaryenc_array_2dim.encode([[]])
+						end
+						it 'encodes text empty array' do
+							expect( textenc_array_2dim.encode([[]]) ).to eq( "{{}}" )
+						end
+						it 'raises an error on 1 dim binary array input to int4' do
+							expect{ binaryenc_array_2dim.encode([1]) }.to raise_error( ArgumentError, /less array dimensions.*1.*2/)
+						end
+						it 'raises an error on 1 dim text array input to int4' do
+							expect{ textenc_array_2dim.encode([1]) }.to raise_error( ArgumentError, /less array dimensions.*1.*2/)
+						end
+
+						it 'raises an error on 0 dim array input to int4' do
+							expect{ binaryenc_array_2dim.encode([]) }.to raise_error( ArgumentError, /less array dimensions.*0.*2/)
+						end
+						it 'raises an error on 0 dim text array input to int4' do
+							expect{ textenc_array_2dim.encode([]) }.to raise_error( ArgumentError, /less array dimensions.*1.*2/)
+						end
+						it 'raises an error on 1 dim text array nil input' do
+							expect{ textenc_array_2dim.encode([nil]) }.to raise_error( ArgumentError, /less array dimensions.*1.*2/)
+						end
+					end
 				end
+
 				context 'one dimensional array' do
 					it 'can encode empty arrays' do
 						expect( textenc_int_array.encode([]) ).to eq( '{}' )
@@ -726,6 +1037,75 @@ describe "PG::Type derivations" do
 					end
 					it 'respects a different delimiter' do
 						expect( textenc_string_array_with_delimiter.encode(['a','b,','c']) ).to eq( '{a;b,;c}' )
+					end
+
+					it 'encodes an array' do
+						exp =["00000001" + "00000001" + "00000000" +
+							"00000002" + "00000001" +
+							"ffffffff" +
+							"00000002" + "3622"
+						].pack("H*")
+
+						expect( binaryenc_array.encode([nil, "6\""]) ).to eq( exp )
+					end
+
+					context 'with dimensions' do
+						let!(:textenc_array_1dim) { textenc_int_array.dup.tap{|a| a.dimensions = 1} }
+						let!(:binaryenc_array_1dim) { binaryenc_array.dup.tap{|a| a.dimensions = 1} }
+
+						it 'encodes an array' do
+							exp =["00000001" + "00000001" + "00000000" +
+							      "00000002" + "00000001" +
+							     "ffffffff" +
+							     "00000002" + "3622"
+							     ].pack("H*")
+
+							expect( binaryenc_array_1dim.encode([nil, "6\""]) ).to eq( exp )
+						end
+						it 'encodes an empty binary array' do
+							exp =["00000000" + "00000001" + "00000000"
+							     ].pack("H*")
+							expect( binaryenc_array_1dim.encode([]) ).to eq( exp )
+						end
+						it 'encodes an empty text array' do
+							expect( textenc_array_1dim.encode([]) ).to eq( "{}" )
+						end
+
+						let!(:binaryenc_int4_array_1dim) { PG::BinaryEncoder::Array.new elements_type: PG::BinaryEncoder::Int4.new, dimensions: 1 }
+						it 'raises an error on binary array input to int4' do
+							expect{ binaryenc_int4_array_1dim.encode([[1]]) }.to raise_error( NoMethodError, /to_i/)
+						end
+						it 'raises an error on text array input to int4' do
+							expect{ textenc_array_1dim.encode([[1]]) }.to raise_error( NoMethodError, /to_i/)
+						end
+					end
+				end
+
+				context 'other dimensional array' do
+					it 'encodes an empty array as zero dimensions' do
+						exp =["00000000" + "00000001" + "00000000"].pack("H*")
+						expect( binaryenc_array.encode([]) ).to eq( exp )
+					end
+					it 'encodes a 6 dimensional array' do
+						exp =["00000006" + "00000001" + "00000000" +
+							"00000001" + "00000001" +
+							"00000001" + "00000001" +
+							"00000001" + "00000001" +
+							"00000001" + "00000001" +
+							"00000001" + "00000001" +
+							"00000001" + "00000001" +
+							"ffffffff"
+						].pack("H*")
+						expect( binaryenc_array.encode([[[[[[nil]]]]]]) ).to eq( exp )
+					end
+					it 'raises an error on too many dimensions' do
+						expect{ binaryenc_array.encode([[[[[[[nil]]]]]]]) }.to raise_error( ArgumentError, /number of array dimensions/)
+					end
+					it 'raises an error on changed dimensions' do
+						expect{ binaryenc_array.encode([[1], 2]) }.to raise_error( ArgumentError, /Array instead of 2 /)
+					end
+					it 'raises an error on varying array sizes' do
+						expect{ binaryenc_array.encode([[1], [2,3]]) }.to raise_error( ArgumentError, /varying number /)
 					end
 				end
 
@@ -804,7 +1184,8 @@ describe "PG::Type derivations" do
 			it "should respond to to_h" do
 				expect( textenc_int_array.to_h ).to eq( {
 					name: nil, oid: 0, format: 0, flags: 0,
-					elements_type: textenc_int, needs_quotation: false, delimiter: ','
+					elements_type: textenc_int, needs_quotation: false, delimiter: ',',
+					dimensions: nil
 				} )
 			end
 
@@ -820,13 +1201,30 @@ describe "PG::Type derivations" do
 				expect( t.needs_quotation? ).to eq( true )
 				expect( t.delimiter ).to eq( ',' )
 				expect( t.elements_type ).to be_nil
+				expect( t.dimensions ).to be_nil
 			end
 
-		it "should give account about memory usage" do
-			expect( ObjectSpace.memsize_of(textenc_int_array) ).to be > DATA_OBJ_MEMSIZE
-			expect( ObjectSpace.memsize_of(textdec_bytea_array) ).to be > DATA_OBJ_MEMSIZE
+			it "should deny changes when frozen" do
+				t = PG::TextEncoder::Array.new.freeze
+				expect{ t.format = 1 }.to raise_error(FrozenError)
+				expect{ t.oid = 0  }.to raise_error(FrozenError)
+				expect{ t.name = "x" }.to raise_error(FrozenError)
+				expect{ t.needs_quotation = true }.to raise_error(FrozenError)
+				expect{ t.delimiter = ","  }.to raise_error(FrozenError)
+				expect{ t.elements_type = nil }.to raise_error(FrozenError)
+				expect{ t.dimensions = 1 }.to raise_error(FrozenError)
+			end
+
+			it "should be shareable for Ractor", :ractor do
+				t = PG::TextEncoder::Array.new.freeze
+				Ractor.make_shareable(t)
+			end
+
+			it "should give account about memory usage" do
+				expect( ObjectSpace.memsize_of(textenc_int_array) ).to be > DATA_OBJ_MEMSIZE
+				expect( ObjectSpace.memsize_of(textdec_bytea_array) ).to be > DATA_OBJ_MEMSIZE
+			end
 		end
-	end
 
 		it "should encode Strings as base64 in TextEncoder" do
 			e = PG::TextEncoder::ToBase64.new
@@ -935,6 +1333,21 @@ describe "PG::Type derivations" do
 					PG::TextEncoder::CopyRow.new
 				end
 
+				it "should deny changes when frozen" do
+					t = PG::TextEncoder::CopyRow.new.freeze
+					expect{ t.format = 1 }.to raise_error(FrozenError)
+					expect{ t.oid = 0  }.to raise_error(FrozenError)
+					expect{ t.name = "x" }.to raise_error(FrozenError)
+					expect{ t.type_map = nil }.to raise_error(FrozenError)
+					expect{ t.delimiter = ","  }.to raise_error(FrozenError)
+					expect{ t.null_string = "NULL" }.to raise_error(FrozenError)
+				end
+
+				it "should be shareable for Ractor", :ractor do
+					t = PG::TextEncoder::CopyRow.new.freeze
+					Ractor.make_shareable(t)
+				end
+
 				it "should give account about memory usage" do
 					expect( ObjectSpace.memsize_of(encoder) ).to be > DATA_OBJ_MEMSIZE
 				end
@@ -1003,6 +1416,57 @@ describe "PG::Type derivations" do
 			end
 		end
 
+		describe PG::BinaryEncoder::CopyRow do
+			context "with default typemap" do
+				let!(:encoder) do
+					PG::BinaryEncoder::CopyRow.new
+				end
+
+				it "should encode different types of Ruby objects" do
+					expect( encoder.encode(["x", "yz"]) ).
+						to eq("\x00\x02\x00\x00\x00\x01x\x00\x00\x00\x02yz")
+				end
+
+				it 'should output a string with correct character encoding' do
+					v = encoder.encode(["Héllo"], "iso-8859-1")
+					expect( v.encoding ).to eq( Encoding::ISO_8859_1 )
+					expect( v.b ).to eq( "\x00\x01\x00\x00\x00\x05H\xE9llo".b )
+				end
+			end
+
+			context "with TypeMapByClass" do
+				let!(:tm) do
+					tm = PG::TypeMapByClass.new
+					tm[Integer] = binaryenc_int4
+					tm[Float] = intenc_incrementer
+					tm
+				end
+				let!(:encoder) do
+					PG::BinaryEncoder::CopyRow.new type_map: tm
+				end
+
+				it "should have reasonable default values" do
+					expect( encoder.name ).to be_nil
+				end
+
+				it "copies all attributes with #dup" do
+					encoder.name = "test"
+					encoder.type_map = PG::TypeMapByColumn.new []
+					encoder2 = encoder.dup
+					expect( encoder.object_id ).to_not eq( encoder2.object_id )
+					expect( encoder2.name ).to eq( "test" )
+					expect( encoder2.type_map ).to be_a_kind_of( PG::TypeMapByColumn )
+				end
+
+				it "should encode different types of Ruby objects" do
+					expect( encoder.encode([]) ).to eq("\x00\x00")
+					expect( encoder.encode(["a"]) ).to eq("\x00\x01\x00\x00\x00\x01a")
+					expect( encoder.encode([:xyz, 123, 12.1, "abcdefg", nil]) ).
+						to eq("\x00\x05\x00\x00\x00\x03xyz\x00\x00\x00\x04\x00\x00\x00{\x00\x00\x00\x0313 \x00\x00\x00\aabcdefg\xFF\xFF\xFF\xFF".b)
+				end
+			end
+		end
+
 		describe PG::TextDecoder::CopyRow do
 			context "with default typemap" do
 				let!(:decoder) do
@@ -1015,9 +1479,10 @@ describe "PG::Type derivations" do
 					end
 
 					it 'should respect input character encoding' do
-						v = decoder.decode("Héllo\n".encode("iso-8859-1")).first
-						expect( v.encoding ).to eq(Encoding::ISO_8859_1)
-						expect( v ).to eq("Héllo".encode("iso-8859-1"))
+						v = decoder.decode("Héllo\n".encode("EUC-JP")).first
+						expect( v.encoding ).to eq(Encoding::EUC_JP)
+						expect( v ).to eq("Héllo".encode("EUC-JP"))
+						expect( v.length ).to eq(5)
 					end
 				end
 			end
@@ -1041,6 +1506,65 @@ describe "PG::Type derivations" do
 				end
 			end
 		end
+
+		describe PG::BinaryDecoder::CopyRow do
+			context "with default typemap" do
+				let!(:decoder) do
+					PG::BinaryDecoder::CopyRow.new
+				end
+
+				describe '#decode' do
+					it "should decode COPY binary format to array of strings" do
+						expect( decoder.decode([3, -1, 2, "xy", 1, "z"].pack("nNNa*Na*")) )
+								.to eq( [nil, "xy", "z"] )
+					end
+
+					it "should ignore COPY binary header before data" do
+						expect( decoder.decode(["PGCOPY\n\377\r\n\0", 0, 1, "x", 3, 2, "xy", 1, "z", -1].pack("a*NNa*nNa*Na*N")) )
+								.to eq( ["xy", "z", nil] )
+					end
+
+					it "should decode COPY data trailer to nil" do
+						expect( decoder.decode([-1].pack("n")) )
+								.to eq( nil )
+					end
+
+					it "should raise an error at garbage COPY format" do
+						expect{ decoder.decode("123\t \0\\\t\\") }
+								.to raise_error(ArgumentError, /premature.*at position: 7$/)
+					end
+
+					it "should raise an error at extra data after one row" do
+						expect{ decoder.decode([1, -1, 2].pack("nNN")) }
+								.to raise_error(ArgumentError, /trailing data.*at position: 7$/)
+					end
+
+					it "should raise an error at shortened COPY data" do
+						data = [3, -1, 2, "xy", 1, "z"].pack("nNNa*Na*")
+						(0 .. data.bytesize-1).each do |len|
+							expect{ decoder.decode(data[0, len]) }
+								.to raise_error(ArgumentError)
+						end
+					end
+				end
+			end
+
+			context "with TypeMapByColumn" do
+				let!(:tm) do
+					PG::TypeMapByColumn.new [binarydec_integer, binarydec_string, intdec_incrementer, nil]
+				end
+				let!(:decoder) do
+					PG::BinaryDecoder::CopyRow.new type_map: tm
+				end
+
+				describe '#decode' do
+					it "should decode different types of Ruby objects" do
+						expect( decoder.decode([4, 2, "\x01\x02", 7, " \0\t\n\r\xff ", 0, "", 3, "abc"].pack("nNa*Na*Na*Na*")) )
+								.to eq( [258, " \0\t\n\r\xff ".b, 1, "abc"] )
+					end
+				end
+			end
+		end
 	end
 
 	describe PG::RecordCoder do
@@ -1048,6 +1572,19 @@ describe "PG::Type derivations" do
 			context "with default typemap" do
 				let!(:encoder) do
 					PG::TextEncoder::Record.new
+				end
+
+				it "should deny changes when frozen" do
+					t = PG::TextEncoder::Record.new.freeze
+					expect{ t.format = 1 }.to raise_error(FrozenError)
+					expect{ t.oid = 0  }.to raise_error(FrozenError)
+					expect{ t.name = "x" }.to raise_error(FrozenError)
+					expect{ t.type_map = nil }.to raise_error(FrozenError)
+				end
+
+				it "should be shareable for Ractor", :ractor do
+					t = PG::TextEncoder::Record.new.freeze
+					Ractor.make_shareable(t)
 				end
 
 				it "should give account about memory usage" do

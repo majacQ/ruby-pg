@@ -15,7 +15,7 @@
 #       pg_tmbo_mark,
 #       RUBY_TYPED_DEFAULT_FREE,
 #       pg_tmbo_memsize,
-#   //    pg_compact_callback(pg_tmbo_compact),
+#   //    pg_tmbo_compact,
 #     },
 #
 # This should result in a segmentation fault aborting the whole process.
@@ -51,11 +51,21 @@ describe "GC.compact", if: GC.respond_to?(:compact) do
 		CPYENC = PG::TextEncoder::CopyRow.new type_map: TM3
 		RECENC = PG::TextEncoder::Record.new type_map: TM3
 
-		# Use GC.verify_compaction_references instead of GC.compact .
-		# This has the advantage that all movable objects are actually moved.
-		# The downside is that it doubles the heap space of the Ruby process.
-		# Therefore we call it only once and do several tests afterwards.
-		GC.verify_compaction_references(toward: :empty, double_heap: true)
+		if defined?(PG::CancelConnection)
+			CANCON = PG::CancelConnection.new(CONN2)
+			CANCON.start
+			CANCON.socket_io
+		end
+
+		begin
+			# Use GC.verify_compaction_references instead of GC.compact .
+			# This has the advantage that all movable objects are actually moved.
+			# The downside is that it doubles the heap space of the Ruby process.
+			# Therefore we call it only once and do several tests afterwards.
+			GC.verify_compaction_references(toward: :empty, double_heap: true)
+		rescue NotImplementedError, NoMethodError => err
+			skip("GC.compact skipped: #{err}")
+		end
 	end
 
 	it "should compact PG::TypeMapByClass #328" do
@@ -95,6 +105,10 @@ describe "GC.compact", if: GC.respond_to?(:compact) do
 
 	it "should compact PG::RecordCoder" do
 		expect( RECENC.encode([34]) ).to eq( '("34")' )
+	end
+
+	it "should compact PG::CancelConnection", :postgresql_17 do
+		expect( CANCON.socket_io ).to be_kind_of( IO )
 	end
 
 	after :all do

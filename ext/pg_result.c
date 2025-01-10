@@ -147,9 +147,7 @@ pgresult_clear( void *_this )
 	t_pg_result *this = (t_pg_result *)_this;
 	if( this->pgresult && !this->autoclear ){
 		PQclear(this->pgresult);
-#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
 		rb_gc_adjust_memory_usage(-this->result_size);
-#endif
 	}
 	this->result_size = 0;
 	this->nfields = -1;
@@ -180,10 +178,10 @@ static const rb_data_type_t pgresult_type = {
 		pgresult_gc_mark,
 		pgresult_gc_free,
 		pgresult_memsize,
-		pg_compact_callback(pgresult_gc_compact),
+		pgresult_gc_compact,
 	},
 	0, 0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 /* Needed by sequel_pg gem, do not delete */
@@ -208,6 +206,8 @@ pg_new_result2(PGresult *result, VALUE rb_pgconn)
 
 	this = (t_pg_result *)xmalloc(sizeof(*this) +  sizeof(*this->fnames) * nfields);
 	this->pgresult = result;
+	/* Initialize connection and typemap prior to any object allocations,
+	 * to make sure valid objects are marked. */
 	this->connection = rb_pgconn;
 	this->typemap = pg_typemap_all_strings;
 	this->p_typemap = RTYPEDDATA_DATA( this->typemap );
@@ -224,7 +224,8 @@ pg_new_result2(PGresult *result, VALUE rb_pgconn)
 		t_typemap *p_typemap = RTYPEDDATA_DATA(typemap);
 
 		this->enc_idx = p_conn->enc_idx;
-		this->typemap = p_typemap->funcs.fit_to_result( typemap, self );
+		typemap = p_typemap->funcs.fit_to_result( typemap, self );
+		RB_OBJ_WRITE(self, &this->typemap, typemap);
 		this->p_typemap = RTYPEDDATA_DATA( this->typemap );
 		this->flags = p_conn->flags;
 	} else {
@@ -250,9 +251,7 @@ pg_new_result(PGresult *result, VALUE rb_pgconn)
 	 */
 	this->result_size = pgresult_approx_size(result);
 
-#ifdef HAVE_RB_GC_ADJUST_MEMORY_USAGE
 	rb_gc_adjust_memory_usage(this->result_size);
-#endif
 
 	return self;
 }
@@ -318,10 +317,19 @@ pg_result_check( VALUE self )
 		case PGRES_SINGLE_TUPLE:
 		case PGRES_EMPTY_QUERY:
 		case PGRES_COMMAND_OK:
+#ifdef HAVE_PQENTERPIPELINEMODE
+		case PGRES_PIPELINE_SYNC:
+#endif
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+		case PGRES_TUPLES_CHUNK:
+#endif
 			return self;
 		case PGRES_BAD_RESPONSE:
 		case PGRES_FATAL_ERROR:
 		case PGRES_NONFATAL_ERROR:
+#ifdef HAVE_PQENTERPIPELINEMODE
+		case PGRES_PIPELINE_ABORTED:
+#endif
 			error = rb_str_new2( PQresultErrorMessage(this->pgresult) );
 			break;
 		default:
@@ -368,17 +376,37 @@ VALUE
 pg_result_clear(VALUE self)
 {
 	t_pg_result *this = pgresult_get_this(self);
+	rb_check_frozen(self);
 	pgresult_clear( this );
 	return Qnil;
 }
 
 /*
  * call-seq:
+ *    res.freeze
+ *
+ * Freeze the PG::Result object and unlink the result from the related PG::Connection.
+ *
+ * A frozen PG::Result object doesn't allow any streaming and it can't be cleared.
+ * It also denies setting a type_map or field_name_type.
+ *
+ */
+static VALUE
+pg_result_freeze(VALUE self)
+{
+	t_pg_result *this = pgresult_get_this(self);
+
+	RB_OBJ_WRITE(self, &this->connection, Qnil);
+	return rb_call_super(0, NULL);
+}
+
+/*
+ * call-seq:
  *    res.cleared?      -> boolean
  *
- * Returns +true+ if the backend result memory has been free'd.
+ * Returns +true+ if the backend result memory has been freed.
  */
-VALUE
+static VALUE
 pgresult_cleared_p( VALUE self )
 {
 	t_pg_result *this = pgresult_get_this(self);
@@ -390,12 +418,12 @@ pgresult_cleared_p( VALUE self )
  *    res.autoclear?      -> boolean
  *
  * Returns +true+ if the underlying C struct will be cleared at the end of a callback.
- * This applies only to Result objects received by the block to PG::Cinnection#set_notice_receiver .
+ * This applies only to Result objects received by the block to PG::Connection#set_notice_receiver .
  *
  * All other Result objects are automatically cleared by the GC when the object is no longer in use or manually by PG::Result#clear .
  *
  */
-VALUE
+static VALUE
 pgresult_autoclear_p( VALUE self )
 {
 	t_pg_result *this = pgresult_get_this(self);
@@ -471,7 +499,8 @@ static void pgresult_init_fnames(VALUE self)
 
 		for( i=0; i<nfields; i++ ){
 			char *cfname = PQfname(this->pgresult, i);
-			this->fnames[i] = pg_cstr_to_sym(cfname, this->flags, this->enc_idx);
+			VALUE fname = pg_cstr_to_sym(cfname, this->flags, this->enc_idx);
+			RB_OBJ_WRITE(self, &this->fnames[i], fname);
 			this->nfields = i + 1;
 		}
 		this->nfields = nfields;
@@ -518,6 +547,12 @@ static void pgresult_init_fnames(VALUE self)
  * * +PGRES_NONFATAL_ERROR+
  * * +PGRES_FATAL_ERROR+
  * * +PGRES_COPY_BOTH+
+ * * +PGRES_SINGLE_TUPLE+
+ * * +PGRES_TUPLES_CHUNK+
+ * * +PGRES_PIPELINE_SYNC+
+ * * +PGRES_PIPELINE_ABORTED+
+ *
+ * Use <tt>res.res_status</tt> to retrieve the string representation.
  */
 static VALUE
 pgresult_result_status(VALUE self)
@@ -527,16 +562,38 @@ pgresult_result_status(VALUE self)
 
 /*
  * call-seq:
- *    res.res_status( status ) -> String
+ *    PG::Result.res_status( status ) -> String
  *
- * Returns the string representation of status +status+.
+ * Returns the string representation of +status+.
  *
 */
 static VALUE
-pgresult_res_status(VALUE self, VALUE status)
+pgresult_s_res_status(VALUE self, VALUE status)
+{
+	return rb_utf8_str_new_cstr(PQresStatus(NUM2INT(status)));
+}
+
+/*
+ * call-seq:
+ *    res.res_status -> String
+ *    res.res_status( status ) -> String
+ *
+ * Returns the string representation of the status of the result or of the provided +status+.
+ *
+ */
+static VALUE
+pgresult_res_status(int argc, VALUE *argv, VALUE self)
 {
 	t_pg_result *this = pgresult_get_this_safe(self);
-	VALUE ret = rb_str_new2(PQresStatus(NUM2INT(status)));
+	VALUE ret;
+
+	if( argc == 0 ){
+		ret = rb_str_new2(PQresStatus(PQresultStatus(this->pgresult)));
+	}else if( argc == 1 ){
+		ret = rb_str_new2(PQresStatus(NUM2INT(argv[0])));
+	}else{
+		rb_raise(rb_eArgError, "only 0 or 1 arguments expected");
+	}
 	PG_ENCODING_SET_NOCHECK(ret, this->enc_idx);
 	return ret;
 }
@@ -556,14 +613,12 @@ pgresult_error_message(VALUE self)
 	return ret;
 }
 
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 /*
  * call-seq:
  *    res.verbose_error_message( verbosity, show_context ) -> String
  *
  * Returns a reformatted version of the error message associated with a PGresult object.
  *
- * Available since PostgreSQL-9.6
  */
 static VALUE
 pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
@@ -582,7 +637,6 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
 
 	return ret;
 }
-#endif
 
 /*
  * call-seq:
@@ -607,7 +661,7 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
  * An example:
  *
  *   begin
- *       conn.exec( "SELECT * FROM nonexistant_table" )
+ *       conn.exec( "SELECT * FROM nonexistent_table" )
  *   rescue PG::Error => err
  *       p [
  *           err.result.error_field( PG::Result::PG_DIAG_SEVERITY ),
@@ -627,7 +681,7 @@ pgresult_verbose_error_message(VALUE self, VALUE verbosity, VALUE show_context)
  *
  * Outputs:
  *
- *   ["ERROR", "42P01", "relation \"nonexistant_table\" does not exist", nil, nil,
+ *   ["ERROR", "42P01", "relation \"nonexistent_table\" does not exist", nil, nil,
  *    "15", nil, nil, nil, "path/to/parse_relation.c", "857", "parserOpenTable"]
  */
 static VALUE
@@ -674,6 +728,21 @@ static VALUE
 pgresult_nfields(VALUE self)
 {
 	return INT2NUM(PQnfields(pgresult_get(self)));
+}
+
+/*
+ * call-seq:
+ *    res.binary_tuples() -> Integer
+ *
+ * Returns 1 if the PGresult contains binary data and 0 if it contains text data.
+ *
+ * This function is deprecated (except for its use in connection with COPY), because it is possible for a single PGresult to contain text data in some columns and binary data in others.
+ * Result#fformat is preferred. binary_tuples returns 1 only if all columns of the result are binary (format 1).
+ */
+static VALUE
+pgresult_binary_tuples(VALUE self)
+{
+	return INT2NUM(PQbinaryTuples(pgresult_get(self)));
 }
 
 /*
@@ -1078,7 +1147,7 @@ pgresult_aref(VALUE self, VALUE index)
 	}
 	/* Store a copy of the filled hash for use at the next row. */
 	if( num_tuples > 10 )
-		this->tuple_hash = rb_hash_dup(tuple);
+		RB_OBJ_WRITE(self, &this->tuple_hash, rb_hash_dup(tuple));
 
 	return tuple;
 }
@@ -1260,7 +1329,7 @@ static void ensure_init_for_tuple(VALUE self)
 			rb_hash_aset(field_map, this->fnames[i], INT2FIX(i));
 		}
 		rb_obj_freeze(field_map);
-		this->field_map = field_map;
+		RB_OBJ_WRITE(self, &this->field_map, field_map);
 	}
 }
 
@@ -1348,11 +1417,13 @@ pgresult_type_map_set(VALUE self, VALUE typemap)
 	t_pg_result *this = pgresult_get_this(self);
 	t_typemap *p_typemap;
 
+	rb_check_frozen(self);
 	/* Check type of method param */
 	TypedData_Get_Struct(typemap, t_typemap, &pg_typemap_type, p_typemap);
 
-	this->typemap = p_typemap->funcs.fit_to_result( typemap, self );
-	this->p_typemap = RTYPEDDATA_DATA( this->typemap );
+	typemap = p_typemap->funcs.fit_to_result( typemap, self );
+	RB_OBJ_WRITE(self, &this->typemap, typemap);
+	this->p_typemap = RTYPEDDATA_DATA( typemap );
 
 	return typemap;
 }
@@ -1373,22 +1444,21 @@ pgresult_type_map_get(VALUE self)
 }
 
 
-static void
-yield_hash(VALUE self, int ntuples, int nfields)
+static int
+yield_hash(VALUE self, int ntuples, int nfields, void *data)
 {
 	int tuple_num;
-	t_pg_result *this = pgresult_get_this(self);
 	UNUSED(nfields);
 
 	for(tuple_num = 0; tuple_num < ntuples; tuple_num++) {
 		rb_yield(pgresult_aref(self, INT2NUM(tuple_num)));
 	}
 
-	pgresult_clear( this );
+	return 1; /* clear the result */
 }
 
-static void
-yield_array(VALUE self, int ntuples, int nfields)
+static int
+yield_array(VALUE self, int ntuples, int nfields, void *data)
 {
 	int row;
 	t_pg_result *this = pgresult_get_this(self);
@@ -1404,11 +1474,11 @@ yield_array(VALUE self, int ntuples, int nfields)
 		rb_yield( rb_ary_new4( nfields, row_values ));
 	}
 
-	pgresult_clear( this );
+	return 1; /* clear the result */
 }
 
-static void
-yield_tuple(VALUE self, int ntuples, int nfields)
+static int
+yield_tuple(VALUE self, int ntuples, int nfields, void *data)
 {
 	int tuple_num;
 	t_pg_result *this = pgresult_get_this(self);
@@ -1425,16 +1495,19 @@ yield_tuple(VALUE self, int ntuples, int nfields)
 		VALUE tuple = pgresult_tuple(copy, INT2FIX(tuple_num));
 		rb_yield( tuple );
 	}
+	return 0; /* don't clear the result */
 }
 
-static VALUE
-pgresult_stream_any(VALUE self, void (*yielder)(VALUE, int, int))
+/* Non-static, and data pointer for use by sequel_pg */
+VALUE
+pgresult_stream_any(VALUE self, int (*yielder)(VALUE, int, int, void*), void* data)
 {
 	t_pg_result *this;
-	int nfields;
+	int nfields, nfields2;
 	PGconn *pgconn;
 	PGresult *pgresult;
 
+	rb_check_frozen(self);
 	RETURN_ENUMERATOR(self, 0, NULL);
 
 	this = pgresult_get_this_safe(self);
@@ -1447,23 +1520,37 @@ pgresult_stream_any(VALUE self, void (*yielder)(VALUE, int, int))
 
 		switch( PQresultStatus(pgresult) ){
 			case PGRES_TUPLES_OK:
+			case PGRES_COMMAND_OK:
 				if( ntuples == 0 )
 					return self;
 				rb_raise( rb_eInvalidResultStatus, "PG::Result is not in single row mode");
 			case PGRES_SINGLE_TUPLE:
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+			case PGRES_TUPLES_CHUNK:
+#endif
 				break;
 			default:
 				pg_result_check( self );
 		}
 
-		yielder( self, ntuples, nfields );
+		nfields2 = PQnfields(pgresult);
+		if( nfields != nfields2 ){
+			pgresult_clear( this );
+			rb_raise( rb_eInvalidChangeOfResultFields, "number of fields changed in single row mode from %d to %d - this is a sign for intersection with another query", nfields, nfields2);
+		}
+
+		if( yielder( self, ntuples, nfields, data ) ){
+			pgresult_clear( this );
+		}
+
+		if( gvl_PQisBusy(pgconn) ){
+			/* wait for input (without blocking) before reading each result */
+			pgconn_block( 0, NULL, this->connection );
+		}
 
 		pgresult = gvl_PQgetResult(pgconn);
 		if( pgresult == NULL )
-			rb_raise( rb_eNoResultError, "no result received - possibly an intersection with another result retrieval");
-
-		if( nfields != PQnfields(pgresult) )
-			rb_raise( rb_eInvalidChangeOfResultFields, "number of fields must not change in single row mode");
+			rb_raise( rb_eNoResultError, "no result received - possibly an intersection with another query");
 
 		this->pgresult = pgresult;
 	}
@@ -1485,7 +1572,7 @@ pgresult_stream_any(VALUE self, void (*yielder)(VALUE, int, int))
  * wrapping each row into a dedicated result object, it delivers data in nearly
  * the same speed as with ordinary results.
  *
- * The base result must be in status PGRES_SINGLE_TUPLE.
+ * The base result must be in status PGRES_SINGLE_TUPLE or PGRES_TUPLES_CHUNK.
  * It iterates over all tuples until the status changes to PGRES_TUPLES_OK.
  * A PG::Error is raised for any errors from the server.
  *
@@ -1507,7 +1594,7 @@ pgresult_stream_any(VALUE self, void (*yielder)(VALUE, int, int))
 static VALUE
 pgresult_stream_each(VALUE self)
 {
-	return pgresult_stream_any(self, yield_hash);
+	return pgresult_stream_any(self, yield_hash, NULL);
 }
 
 /*
@@ -1523,7 +1610,7 @@ pgresult_stream_each(VALUE self)
 static VALUE
 pgresult_stream_each_row(VALUE self)
 {
-	return pgresult_stream_any(self, yield_array);
+	return pgresult_stream_any(self, yield_array, NULL);
 }
 
 /*
@@ -1540,7 +1627,7 @@ pgresult_stream_each_tuple(VALUE self)
 	/* allocate VALUEs that are shared between all streamed tuples */
 	ensure_init_for_tuple(self);
 
-	return pgresult_stream_any(self, yield_tuple);
+	return pgresult_stream_any(self, yield_tuple, NULL);
 }
 
 /*
@@ -1551,7 +1638,7 @@ pgresult_stream_each_tuple(VALUE self)
  * It can be set to one of:
  * * +:string+ to use String based field names
  * * +:symbol+ to use Symbol based field names
- * * +:static_symbol+ to use pinned Symbol (can not be garbage collected) - Don't use this, it will probably removed in future.
+ * * +:static_symbol+ to use pinned Symbol (can not be garbage collected) - Don't use this, it will probably be removed in future.
  *
  * The default is retrieved from PG::Connection#field_name_type , which defaults to +:string+ .
  *
@@ -1568,6 +1655,8 @@ static VALUE
 pgresult_field_name_type_set(VALUE self, VALUE sym)
 {
 	t_pg_result *this = pgresult_get_this(self);
+
+	rb_check_frozen(self);
 	if( this->nfields != -1 ) rb_raise(rb_eArgError, "field names are already materialized");
 
 	this->flags &= ~PG_RESULT_FIELD_NAMES_MASK;
@@ -1601,7 +1690,7 @@ pgresult_field_name_type_get(VALUE self)
 }
 
 void
-init_pg_result()
+init_pg_result(void)
 {
 	sym_string = ID2SYM(rb_intern("string"));
 	sym_symbol = ID2SYM(rb_intern("symbol"));
@@ -1614,22 +1703,23 @@ init_pg_result()
 
 	/******     PG::Result INSTANCE METHODS: libpq     ******/
 	rb_define_method(rb_cPGresult, "result_status", pgresult_result_status, 0);
-	rb_define_method(rb_cPGresult, "res_status", pgresult_res_status, 1);
+	rb_define_method(rb_cPGresult, "res_status", pgresult_res_status, -1);
+	rb_define_singleton_method(rb_cPGresult, "res_status", pgresult_s_res_status, 1);
 	rb_define_method(rb_cPGresult, "error_message", pgresult_error_message, 0);
 	rb_define_alias( rb_cPGresult, "result_error_message", "error_message");
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 	rb_define_method(rb_cPGresult, "verbose_error_message", pgresult_verbose_error_message, 2);
 	rb_define_alias( rb_cPGresult, "result_verbose_error_message", "verbose_error_message");
-#endif
 	rb_define_method(rb_cPGresult, "error_field", pgresult_error_field, 1);
 	rb_define_alias( rb_cPGresult, "result_error_field", "error_field" );
 	rb_define_method(rb_cPGresult, "clear", pg_result_clear, 0);
+	rb_define_method(rb_cPGresult, "freeze", pg_result_freeze, 0 );
 	rb_define_method(rb_cPGresult, "check", pg_result_check, 0);
 	rb_define_alias (rb_cPGresult, "check_result", "check");
 	rb_define_method(rb_cPGresult, "ntuples", pgresult_ntuples, 0);
 	rb_define_alias(rb_cPGresult, "num_tuples", "ntuples");
 	rb_define_method(rb_cPGresult, "nfields", pgresult_nfields, 0);
 	rb_define_alias(rb_cPGresult, "num_fields", "nfields");
+	rb_define_method(rb_cPGresult, "binary_tuples", pgresult_binary_tuples, 0);
 	rb_define_method(rb_cPGresult, "fname", pgresult_fname, 1);
 	rb_define_method(rb_cPGresult, "fnumber", pgresult_fnumber, 1);
 	rb_define_method(rb_cPGresult, "ftable", pgresult_ftable, 1);

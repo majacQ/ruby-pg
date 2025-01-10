@@ -33,7 +33,6 @@
  *
  * - PQfreemem -- unnecessary: copied to ruby object, then freed. Ruby object's
  *                memory is freed when it is garbage collected.
- * - PQbinaryTuples -- better to use PQfformat
  * - PQprint -- not very useful
  * - PQsetdb -- not very useful
  * - PQoidStatus -- deprecated, use PQoidValue
@@ -74,6 +73,7 @@ VALUE rb_mPGconstants;
  * The mapping from canonical encoding names in PostgreSQL to ones in Ruby.
  */
 const char * const (pg_enc_pg2ruby_mapping[][2]) = {
+	{"UTF8",          "UTF-8"       },
 	{"BIG5",          "Big5"        },
 	{"EUC_CN",        "GB2312"      },
 	{"EUC_JP",        "EUC-JP"      },
@@ -105,7 +105,6 @@ const char * const (pg_enc_pg2ruby_mapping[][2]) = {
 	{"SHIFT_JIS_2004","Windows-31J" },
 	/* {"SQL_ASCII",     NULL          },  special case*/
 	{"UHC",           "CP949"       },
-	{"UTF8",          "UTF-8"       },
 	{"WIN866",        "IBM866"      },
 	{"WIN874",        "Windows-874" },
 	{"WIN1250",       "Windows-1250"},
@@ -121,55 +120,16 @@ const char * const (pg_enc_pg2ruby_mapping[][2]) = {
 
 
 /*
- * A cache of mapping from PostgreSQL's encoding indices to Ruby's rb_encoding*s.
- */
-static struct st_table *enc_pg2ruby;
-
-
-/*
- * Look up the JOHAB encoding, creating it as a dummy encoding if it's not
- * already defined.
- */
-static rb_encoding *
-pg_find_or_create_johab(void)
-{
-	static const char * const aliases[] = { "JOHAB", "Windows-1361", "CP1361" };
-	int enc_index;
-	size_t i;
-
-	for (i = 0; i < sizeof(aliases)/sizeof(aliases[0]); ++i) {
-		enc_index = rb_enc_find_index(aliases[i]);
-		if (enc_index > 0) return rb_enc_from_index(enc_index);
-	}
-
-	enc_index = rb_define_dummy_encoding(aliases[0]);
-	return rb_enc_from_index(enc_index);
-}
-
-/*
  * Return the given PostgreSQL encoding ID as an rb_encoding.
  *
  * - returns NULL if the client encoding is 'SQL_ASCII'.
  * - returns ASCII-8BIT if the client encoding is unknown.
  */
-rb_encoding *
+static rb_encoding *
 pg_get_pg_encoding_as_rb_encoding( int enc_id )
 {
-	rb_encoding *enc;
-
-	/* Use the cached value if it exists */
-	if ( st_lookup(enc_pg2ruby, (st_data_t)enc_id, (st_data_t*)&enc) ) {
-		return enc;
-	}
-	else {
-		const char *name = pg_encoding_to_char( enc_id );
-
-		enc = pg_get_pg_encname_as_rb_encoding( name );
-		st_insert( enc_pg2ruby, (st_data_t)enc_id, (st_data_t)enc );
-
-		return enc;
-	}
-
+	const char *name = pg_encoding_to_char( enc_id );
+	return pg_get_pg_encname_as_rb_encoding( name );
 }
 
 /*
@@ -185,10 +145,6 @@ pg_get_pg_encname_as_rb_encoding( const char *pg_encname )
 		if ( strcmp(pg_encname, pg_enc_pg2ruby_mapping[i][0]) == 0 )
 			return rb_enc_find( pg_enc_pg2ruby_mapping[i][1] );
 	}
-
-	/* JOHAB isn't a builtin encoding, so make up a dummy encoding if it's seen */
-	if ( strncmp(pg_encname, "JOHAB", 5) == 0 )
-		return pg_find_or_create_johab();
 
 	/* Fallthrough to ASCII-8BIT */
 	return rb_ascii8bit_encoding();
@@ -376,8 +332,13 @@ pg_s_init_ssl(VALUE self, VALUE do_ssl)
  **************************************************************************/
 
 void
-Init_pg_ext()
+Init_pg_ext(void)
 {
+
+#ifdef HAVE_RB_EXT_RACTOR_SAFE
+	rb_ext_ractor_safe(PQisthreadsafe());
+#endif
+
 	if( RTEST(rb_eval_string("ENV['PG_SKIP_DEPRECATION_WARNING']")) ){
 		/* Set all bits to disable all deprecation warnings. */
 		pg_skip_deprecation_warning = 0xFFFF;
@@ -396,8 +357,8 @@ Init_pg_ext()
 	SINGLETON_ALIAS( rb_mPG, "is_threadsafe?", "isthreadsafe" );
 	SINGLETON_ALIAS( rb_mPG, "threadsafe?", "isthreadsafe" );
 
-  rb_define_singleton_method( rb_mPG, "init_openssl", pg_s_init_openssl, 2 );
-  rb_define_singleton_method( rb_mPG, "init_ssl", pg_s_init_ssl, 1 );
+	rb_define_singleton_method( rb_mPG, "init_openssl", pg_s_init_openssl, 2 );
+	rb_define_singleton_method( rb_mPG, "init_ssl", pg_s_init_ssl, 1 );
 
 
 	/******     PG::Connection CLASS CONSTANTS: Connection Status     ******/
@@ -415,14 +376,38 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "CONNECTION_MADE", INT2FIX(CONNECTION_MADE));
 	/* Waiting for a response from the server. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_AWAITING_RESPONSE", INT2FIX(CONNECTION_AWAITING_RESPONSE));
-	/* Received authentication; waiting for backend start-up to ﬁnish. */
+	/* Received authentication; waiting for backend startup. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_AUTH_OK", INT2FIX(CONNECTION_AUTH_OK));
+	/* This state is no longer used. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_SETENV", INT2FIX(CONNECTION_SETENV));
 	/* Negotiating SSL encryption. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_SSL_STARTUP", INT2FIX(CONNECTION_SSL_STARTUP));
-	/* Negotiating environment-driven parameter settings. */
-	rb_define_const(rb_mPGconstants, "CONNECTION_SETENV", INT2FIX(CONNECTION_SETENV));
 	/* Internal state - PG.connect() needed. */
 	rb_define_const(rb_mPGconstants, "CONNECTION_NEEDED", INT2FIX(CONNECTION_NEEDED));
+#if PG_MAJORVERSION_NUM >= 10
+	/* Checking if session is read-write. Available since PostgreSQL-10. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_CHECK_WRITABLE", INT2FIX(CONNECTION_CHECK_WRITABLE));
+#endif
+#if PG_MAJORVERSION_NUM >= 10
+	/* Consuming any extra messages. Available since PostgreSQL-10. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_CONSUME", INT2FIX(CONNECTION_CONSUME));
+#endif
+#if PG_MAJORVERSION_NUM >= 12
+	/* Negotiating GSSAPI. Available since PostgreSQL-12. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_GSS_STARTUP", INT2FIX(CONNECTION_GSS_STARTUP));
+#endif
+#if PG_MAJORVERSION_NUM >= 13
+	/* Checking target server properties. Available since PostgreSQL-13. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_CHECK_TARGET", INT2FIX(CONNECTION_CHECK_TARGET));
+#endif
+#if PG_MAJORVERSION_NUM >= 14
+	/* Checking if server is in standby mode. Available since PostgreSQL-14. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_CHECK_STANDBY", INT2FIX(CONNECTION_CHECK_STANDBY));
+#endif
+#if PG_MAJORVERSION_NUM >= 17
+	/* Waiting for connection attempt to be started. Available since PostgreSQL-17. */
+	rb_define_const(rb_mPGconstants, "CONNECTION_ALLOCATED", INT2FIX(CONNECTION_ALLOCATED));
+#endif
 
 	/******     PG::Connection CLASS CONSTANTS: Nonblocking connection polling status     ******/
 
@@ -470,14 +455,12 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "PQERRORS_SQLSTATE", INT2FIX(PQERRORS_SQLSTATE));
 #endif
 
-#ifdef HAVE_PQRESULTVERBOSEERRORMESSAGE
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_NEVER", INT2FIX(PQSHOW_CONTEXT_NEVER));
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ERRORS", INT2FIX(PQSHOW_CONTEXT_ERRORS));
 	/* See Connection#set_error_context_visibility */
 	rb_define_const(rb_mPGconstants, "PQSHOW_CONTEXT_ALWAYS", INT2FIX(PQSHOW_CONTEXT_ALWAYS));
-#endif
 
 	/******     PG::Connection CLASS CONSTANTS: Check Server Status ******/
 
@@ -525,6 +508,23 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "PGRES_COPY_BOTH", INT2FIX(PGRES_COPY_BOTH));
 	/* Result#result_status constant - Single tuple from larger resultset. */
 	rb_define_const(rb_mPGconstants, "PGRES_SINGLE_TUPLE", INT2FIX(PGRES_SINGLE_TUPLE));
+#ifdef HAVE_PQSETCHUNKEDROWSMODE
+	/* Result#result_status constant - tuple chunk from larger resultset. */
+	rb_define_const(rb_mPGconstants, "PGRES_TUPLES_CHUNK", INT2FIX(PGRES_TUPLES_CHUNK));
+#endif
+
+#ifdef HAVE_PQENTERPIPELINEMODE
+	/* Result#result_status constant - The PG::Result represents a synchronization point in pipeline mode, requested by Connection#pipeline_sync.
+	 *
+	 * This status occurs only when pipeline mode has been selected. */
+	rb_define_const(rb_mPGconstants, "PGRES_PIPELINE_SYNC", INT2FIX(PGRES_PIPELINE_SYNC));
+
+	/* Result#result_status constant - The PG::Result represents a pipeline that has received an error from the server.
+	 *
+	 * Connection#get_result must be called repeatedly, and each time it will return this status code until the end of the current pipeline, at which point it will return PG::PGRES_PIPELINE_SYNC and normal processing can resume.
+	 */
+	rb_define_const(rb_mPGconstants, "PGRES_PIPELINE_ABORTED", INT2FIX(PGRES_PIPELINE_ABORTED));
+#endif
 
 	/******     Result CONSTANTS: result error field codes      ******/
 
@@ -536,20 +536,18 @@ Init_pg_ext()
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY", INT2FIX(PG_DIAG_SEVERITY));
 
-#ifdef PG_DIAG_SEVERITY_NONLOCALIZED
 	/* Result#result_error_field argument constant
 	 *
 	 * The severity; the field contents are ERROR, FATAL, or PANIC (in an error message), or WARNING, NOTICE, DEBUG, INFO, or LOG (in a notice message).
 	 * This is identical to the PG_DIAG_SEVERITY field except that the contents are never localized.
 	 *
-	 * Available since PostgreSQL-9.6
 	 */
 	rb_define_const(rb_mPGconstants, "PG_DIAG_SEVERITY_NONLOCALIZED", INT2FIX(PG_DIAG_SEVERITY_NONLOCALIZED));
-#endif
+
 	/* Result#result_error_field argument constant
 	 *
 	 * The SQLSTATE code for the error.
-	 * The SQLSTATE code identies the type of error that has occurred; it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
+	 * The SQLSTATE code identifies the type of error that has occurred; it can be used by front-end applications to perform specific operations (such as error handling) in response to a particular database error.
 	 * For a list of the possible SQLSTATE codes, see Appendix A.
 	 * This field is not localizable, and is always present.
 	 */
@@ -645,14 +643,42 @@ Init_pg_ext()
 	rb_define_const(rb_mPGconstants, "PG_DIAG_CONSTRAINT_NAME", INT2FIX(PG_DIAG_CONSTRAINT_NAME));
 #endif
 
+#ifdef HAVE_PQENTERPIPELINEMODE
+	/* Connection#pipeline_status constant
+	 *
+	 * The libpq connection is in pipeline mode.
+	 */
+	rb_define_const(rb_mPGconstants, "PQ_PIPELINE_ON", INT2FIX(PQ_PIPELINE_ON));
+
+	/* Connection#pipeline_status constant
+	 *
+	 * The libpq connection is not in pipeline mode.
+	 */
+	rb_define_const(rb_mPGconstants, "PQ_PIPELINE_OFF", INT2FIX(PQ_PIPELINE_OFF));
+
+	/* Connection#pipeline_status constant
+	 *
+	 * The libpq connection is in pipeline mode and an error occurred while processing the current pipeline.
+	 * The aborted flag is cleared when PQgetResult returns a result of type PGRES_PIPELINE_SYNC.
+	 */
+	rb_define_const(rb_mPGconstants, "PQ_PIPELINE_ABORTED", INT2FIX(PQ_PIPELINE_ABORTED));
+#endif
+
 	/* Invalid OID constant */
 	rb_define_const(rb_mPGconstants, "INVALID_OID", INT2FIX(InvalidOid));
 	rb_define_const(rb_mPGconstants, "InvalidOid", INT2FIX(InvalidOid));
 
+	/* PostgreSQL compiled in default port */
+	rb_define_const(rb_mPGconstants, "DEF_PGPORT", INT2FIX(DEF_PGPORT));
+
+#ifdef PG_IS_BINARY_GEM
+	rb_define_const(rb_mPG, "IS_BINARY_GEM", Qtrue);
+#else
+	rb_define_const(rb_mPG, "IS_BINARY_GEM", Qfalse);
+#endif
+
 	/* Add the constants to the toplevel namespace */
 	rb_include_module( rb_mPG, rb_mPGconstants );
-
-	enc_pg2ruby = st_init_numtable();
 
 	/* Initialize the main extension classes */
 	init_pg_connection();
@@ -673,5 +699,5 @@ Init_pg_ext()
 	init_pg_copycoder();
 	init_pg_recordcoder();
 	init_pg_tuple();
+	init_pg_cancon();
 }
-

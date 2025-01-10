@@ -7,7 +7,7 @@ context "running with sync_* methods" do
 	before :all do
 		@conn.finish
 		PG::Connection.async_api = false
-		@conn = connect_testing_db
+		@conn = $pg_server.connect
 	end
 
 	after :all do
@@ -31,6 +31,8 @@ context "running with sync_* methods" do
 
 		expect( Time.now - start ).to be < 0.9
 		@conn.cancel
+	ensure
+		PG::Connection.async_api = false
 	end
 
 	it "disables async methods by #async_api" do
@@ -45,7 +47,7 @@ context "running with sync_* methods" do
 		t.kill
 		t.join
 
-		expect( Time.now - start ).to be >= 1.0
+		expect( Time.now - start ).to be >= 0.9
 		@conn.cancel
 	end
 

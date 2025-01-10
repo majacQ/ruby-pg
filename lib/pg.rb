@@ -6,11 +6,12 @@
 module PG
 
 	# Is this file part of a fat binary gem with bundled libpq?
-	bundled_libpq_path = File.join(__dir__, RUBY_PLATFORM.gsub(/^i386-/, "x86-"))
-	if File.exist?(bundled_libpq_path)
+	# This path must be enabled by add_dll_directory on Windows.
+	gplat = Gem::Platform.local
+	bundled_libpq_path = Dir[File.expand_path("../ports/#{gplat.cpu}-#{gplat.os}*/lib", __dir__)].first
+	if bundled_libpq_path
 		POSTGRESQL_LIB_PATH = bundled_libpq_path
 	else
-		bundled_libpq_path = nil
 		# Try to load libpq path as found by extconf.rb
 		begin
 			require "pg/postgresql_lib_path"
@@ -22,7 +23,8 @@ module PG
 	end
 
 	add_dll_path = proc do |path, &block|
-		if RUBY_PLATFORM =~/(mswin|mingw)/i && path && File.exist?(path)
+		if RUBY_PLATFORM =~/(mswin|mingw)/i && path
+			BUNDLED_LIBPQ_WITH_UNIXSOCKET = false
 			begin
 				require 'ruby_installer/runtime'
 				RubyInstaller::Runtime.add_dll_directory(path, &block)
@@ -33,55 +35,110 @@ module PG
 				ENV['PATH'] = old_path
 			end
 		else
-			# No need to set a load path manually - it's set as library rpath.
+			# libpq is found by a relative rpath in the cross compiled extension dll
+			# or by the system library loader
 			block.call
+			BUNDLED_LIBPQ_WITH_UNIXSOCKET = RUBY_PLATFORM=~/linux/i && PG::IS_BINARY_GEM
 		end
 	end
 
 	# Add a load path to the one retrieved from pg_config
 	add_dll_path.call(POSTGRESQL_LIB_PATH) do
-		if bundled_libpq_path
-			# It's a Windows binary gem, try the <major>.<minor> subdirectory
+		begin
+			# Try the <major>.<minor> subdirectory for fat binary gems
 			major_minor = RUBY_VERSION[ /^(\d+\.\d+)/ ] or
 				raise "Oops, can't extract the major/minor version from #{RUBY_VERSION.dump}"
 			require "#{major_minor}/pg_ext"
-		else
+		rescue LoadError
 			require 'pg_ext'
 		end
 	end
 
-
-	class NotAllCopyDataRetrieved < PG::Error
-	end
-
-	### Get the PG library version. If +include_buildnum+ is +true+, include the build ID.
-	def self::version_string( include_buildnum=false )
-		vstring = "%s %s" % [ self.name, VERSION ]
-		vstring << " (build %s)" % [ REVISION[/: ([[:xdigit:]]+)/, 1] || '0' ] if include_buildnum
-		return vstring
+	# Get the PG library version.
+	#
+	# +include_buildnum+ is no longer used and any value passed will be ignored.
+	def self.version_string( include_buildnum=nil )
+		"%s %s" % [ self.name, VERSION ]
 	end
 
 
 	### Convenience alias for PG::Connection.new.
-	def self::connect( *args )
-		return PG::Connection.new( *args )
+	def self.connect( *args, &block )
+		Connection.new( *args, &block )
 	end
 
+	if defined?(Ractor.make_shareable)
+		def self.make_shareable(obj)
+			Ractor.make_shareable(obj)
+		end
+	else
+		def self.make_shareable(obj)
+			obj.freeze
+		end
+	end
 
+	module BinaryDecoder
+		%i[ TimestampUtc TimestampUtcToLocal TimestampLocal ].each do |klass|
+			autoload klass, 'pg/binary_decoder/timestamp'
+		end
+		autoload :Date, 'pg/binary_decoder/date'
+	end
+	module BinaryEncoder
+		%i[ TimestampUtc TimestampLocal ].each do |klass|
+			autoload klass, 'pg/binary_encoder/timestamp'
+		end
+	end
+	module TextDecoder
+		%i[ TimestampUtc TimestampUtcToLocal TimestampLocal TimestampWithoutTimeZone TimestampWithTimeZone ].each do |klass|
+			autoload klass, 'pg/text_decoder/timestamp'
+		end
+		autoload :Date, 'pg/text_decoder/date'
+		autoload :Inet, 'pg/text_decoder/inet'
+		autoload :JSON, 'pg/text_decoder/json'
+		autoload :Numeric, 'pg/text_decoder/numeric'
+	end
+	module TextEncoder
+		%i[ TimestampUtc TimestampWithoutTimeZone TimestampWithTimeZone ].each do |klass|
+			autoload klass, 'pg/text_encoder/timestamp'
+		end
+		autoload :Date, 'pg/text_encoder/date'
+		autoload :Inet, 'pg/text_encoder/inet'
+		autoload :JSON, 'pg/text_encoder/json'
+		autoload :Numeric, 'pg/text_encoder/numeric'
+	end
+
+	autoload :BasicTypeMapBasedOnResult, 'pg/basic_type_map_based_on_result'
+	autoload :BasicTypeMapForQueries, 'pg/basic_type_map_for_queries'
+	autoload :BasicTypeMapForResults, 'pg/basic_type_map_for_results'
+	autoload :BasicTypeRegistry, 'pg/basic_type_registry'
 	require 'pg/exceptions'
-	require 'pg/constants'
 	require 'pg/coder'
-	require 'pg/binary_decoder'
-	require 'pg/text_encoder'
-	require 'pg/text_decoder'
-	require 'pg/basic_type_registry'
-	require 'pg/basic_type_map_based_on_result'
-	require 'pg/basic_type_map_for_queries'
-	require 'pg/basic_type_map_for_results'
 	require 'pg/type_map_by_column'
 	require 'pg/connection'
+	require 'pg/cancel_connection'
 	require 'pg/result'
 	require 'pg/tuple'
-	require 'pg/version'
+	autoload :VERSION, 'pg/version'
+
+
+	# Avoid "uninitialized constant Truffle::WarningOperations" on Truffleruby up to 22.3.1
+	if RUBY_ENGINE=="truffleruby" && !defined?(Truffle::WarningOperations)
+		module TruffleFixWarn
+			def warn(str, category=nil)
+				super(str)
+			end
+		end
+		Warning.extend(TruffleFixWarn)
+	end
+
+	# Ruby-3.4+ prints a warning, if bigdecimal is required but not in the Gemfile.
+	# But it's a false positive, since we enable bigdecimal depending features only if it's available.
+	# And most people don't need these features.
+	def self.require_bigdecimal_without_warning
+		oldverb, $VERBOSE = $VERBOSE, nil
+		require "bigdecimal"
+	ensure
+		$VERBOSE = oldverb
+	end
 
 end # module PG

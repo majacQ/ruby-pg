@@ -54,6 +54,7 @@ pg_tmbc_fit_to_query( VALUE self, VALUE params )
 	t_tmbc *this = RTYPEDDATA_DATA( self );
 	t_typemap *default_tm;
 
+	Check_Type(params, T_ARRAY);
 	nfields = (int)RARRAY_LEN( params );
 	if ( this->nfields != nfields ) {
 		rb_raise( rb_eArgError, "number of result fields (%d) does not match number of mapped columns (%d)",
@@ -150,10 +151,12 @@ pg_tmbc_typecast_copy_get( t_typemap *p_typemap, VALUE field_str, int fieldno, i
 
 	/* Is it a pure String conversion? Then we can directly send field_str to the user. */
 	if( dec_func == pg_text_dec_string ){
+		rb_str_modify(field_str);
 		PG_ENCODING_SET_NOCHECK( field_str, enc_idx );
 		return field_str;
 	}
 	if( dec_func == pg_bin_dec_bytea ){
+		rb_str_modify(field_str);
 		PG_ENCODING_SET_NOCHECK( field_str, rb_ascii8bit_encindex() );
 		return field_str;
 	}
@@ -226,11 +229,11 @@ static const rb_data_type_t pg_tmbc_type = {
 		pg_tmbc_mark,
 		pg_tmbc_free,
 		pg_tmbc_memsize,
-		pg_compact_callback(pg_tmbc_compact),
+		pg_tmbc_compact,
 	},
 	&pg_typemap_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -241,7 +244,7 @@ pg_tmbc_s_allocate( VALUE klass )
 }
 
 VALUE
-pg_tmbc_allocate()
+pg_tmbc_allocate(void)
 {
 	return pg_tmbc_s_allocate(rb_cTypeMapByColumn);
 }
@@ -264,13 +267,14 @@ pg_tmbc_init(VALUE self, VALUE conv_ary)
 	t_tmbc *this;
 	int conv_ary_len;
 
+	rb_check_frozen(self);
 	Check_Type(conv_ary, T_ARRAY);
 	conv_ary_len = RARRAY_LENINT(conv_ary);
 	this = xmalloc(sizeof(t_tmbc) + sizeof(struct pg_tmbc_converter) * conv_ary_len);
 	/* Set nfields to 0 at first, so that GC mark function doesn't access uninitialized memory. */
 	this->nfields = 0;
 	this->typemap.funcs = pg_tmbc_funcs;
-	this->typemap.default_typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap.default_typemap, pg_typemap_all_strings);
 	RTYPEDDATA_DATA(self) = this;
 
 	for(i=0; i<conv_ary_len; i++)
@@ -281,8 +285,11 @@ pg_tmbc_init(VALUE self, VALUE conv_ary)
 			/* no type cast */
 			this->convs[i].cconv = NULL;
 		} else {
+			t_pg_coder *p_coder;
 			/* Check argument type and store the coder pointer */
-			TypedData_Get_Struct(obj, t_pg_coder, &pg_coder_type, this->convs[i].cconv);
+			TypedData_Get_Struct(obj, t_pg_coder, &pg_coder_type, p_coder);
+			RB_OBJ_WRITTEN(self, Qnil, p_coder->coder_obj);
+			this->convs[i].cconv = p_coder;
 		}
 	}
 
@@ -318,7 +325,7 @@ pg_tmbc_coders(VALUE self)
 }
 
 void
-init_pg_type_map_by_column()
+init_pg_type_map_by_column(void)
 {
 	s_id_decode = rb_intern("decode");
 	s_id_encode = rb_intern("encode");

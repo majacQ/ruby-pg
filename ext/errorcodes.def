@@ -367,6 +367,10 @@
   register_error_class( "2203F", klass );
 }
 {
+  VALUE klass = define_error_class( "SqlJsonItemCannotBeCastToTargetType", "22" );
+  register_error_class( "2203G", klass );
+}
+{
   VALUE klass = define_error_class( "IntegrityConstraintViolation", NULL );
   register_error_class( "23000", klass );
   register_error_class( "23", klass );
@@ -448,6 +452,10 @@
 {
   VALUE klass = define_error_class( "IdleInTransactionSessionTimeout", "25" );
   register_error_class( "25P03", klass );
+}
+{
+  VALUE klass = define_error_class( "TransactionTimeout", "25" );
+  register_error_class( "25P04", klass );
 }
 {
   VALUE klass = define_error_class( "InvalidSqlStatementName", NULL );
@@ -880,11 +888,6 @@
 {
   VALUE klass = define_error_class( "DuplicateFile", "58" );
   register_error_class( "58P02", klass );
-}
-{
-  VALUE klass = define_error_class( "SnapshotTooOld", NULL );
-  register_error_class( "72000", klass );
-  register_error_class( "72", klass );
 }
 {
   VALUE klass = define_error_class( "ConfigFileError", NULL );

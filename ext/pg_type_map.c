@@ -33,11 +33,11 @@ const rb_data_type_t pg_typemap_type = {
 		pg_typemap_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_typemap_memsize,
-		pg_compact_callback(pg_typemap_compact),
+		pg_typemap_compact,
 	},
 	0,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 VALUE rb_cTypeMap;
@@ -132,9 +132,10 @@ pg_typemap_default_type_map_set(VALUE self, VALUE typemap)
 	t_typemap *tm;
 	UNUSED(tm);
 
+	rb_check_frozen(self);
 	/* Check type of method param */
 	TypedData_Get_Struct(typemap, t_typemap, &pg_typemap_type, tm);
-	this->default_typemap = typemap;
+	RB_OBJ_WRITE(self, &this->default_typemap, typemap);
 
 	return typemap;
 }
@@ -176,7 +177,7 @@ pg_typemap_with_default_type_map(VALUE self, VALUE typemap)
 }
 
 void
-init_pg_type_map()
+init_pg_type_map(void)
 {
 	s_id_fit_to_query = rb_intern("fit_to_query");
 	s_id_fit_to_result = rb_intern("fit_to_result");

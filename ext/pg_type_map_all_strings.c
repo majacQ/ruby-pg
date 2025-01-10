@@ -14,11 +14,11 @@ static const rb_data_type_t pg_tmas_type = {
 		pg_typemap_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_typemap_memsize,
-		pg_compact_callback(pg_typemap_compact),
+		pg_typemap_compact,
 	},
 	&pg_typemap_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 VALUE rb_cTypeMapAllStrings;
@@ -76,6 +76,7 @@ pg_tmas_fit_to_copy_get( VALUE self )
 static VALUE
 pg_tmas_typecast_copy_get( t_typemap *p_typemap, VALUE field_str, int fieldno, int format, int enc_idx )
 {
+	rb_str_modify(field_str);
 	if( format == 0 ){
 		PG_ENCODING_SET_NOCHECK( field_str, enc_idx );
 	} else {
@@ -104,7 +105,7 @@ pg_tmas_s_allocate( VALUE klass )
 
 
 void
-init_pg_type_map_all_strings()
+init_pg_type_map_all_strings(void)
 {
 	/*
 	 * Document-class: PG::TypeMapAllStrings < PG::TypeMap
@@ -124,6 +125,6 @@ init_pg_type_map_all_strings()
 	rb_cTypeMapAllStrings = rb_define_class_under( rb_mPG, "TypeMapAllStrings", rb_cTypeMap );
 	rb_define_alloc_func( rb_cTypeMapAllStrings, pg_tmas_s_allocate );
 
-	pg_typemap_all_strings = rb_funcall( rb_cTypeMapAllStrings, rb_intern("new"), 0 );
+	pg_typemap_all_strings = rb_obj_freeze( rb_funcall( rb_cTypeMapAllStrings, rb_intern("new"), 0 ));
 	rb_gc_register_address( &pg_typemap_all_strings );
 }

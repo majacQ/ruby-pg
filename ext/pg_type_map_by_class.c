@@ -153,11 +153,11 @@ static const rb_data_type_t pg_tmbk_type = {
 		pg_tmbk_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_tmbk_memsize,
-		pg_compact_callback(pg_tmbk_compact),
+		pg_tmbk_compact,
 	},
 	&pg_typemap_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -173,12 +173,12 @@ pg_tmbk_s_allocate( VALUE klass )
 	this->typemap.funcs.typecast_result_value = pg_typemap_result_value;
 	this->typemap.funcs.typecast_query_param = pg_tmbk_typecast_query_param;
 	this->typemap.funcs.typecast_copy_get = pg_typemap_typecast_copy_get;
-	this->typemap.default_typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap.default_typemap, pg_typemap_all_strings);
 
 	/* We need to store self in the this-struct, because pg_tmbk_typecast_query_param(),
 	 * is called with the this-pointer only. */
 	this->self = self;
-	this->klass_to_coder = rb_hash_new();
+	RB_OBJ_WRITE(self, &this->klass_to_coder, rb_hash_new());
 
 	/* The cache is properly initialized by TypedData_Make_Struct(). */
 
@@ -204,6 +204,8 @@ static VALUE
 pg_tmbk_aset( VALUE self, VALUE klass, VALUE coder )
 {
 	t_tmbk *this = RTYPEDDATA_DATA( self );
+
+	rb_check_frozen(self);
 
 	if(NIL_P(coder)){
 		rb_hash_delete( this->klass_to_coder, klass );
@@ -247,7 +249,7 @@ pg_tmbk_coders( VALUE self )
 }
 
 void
-init_pg_type_map_by_class()
+init_pg_type_map_by_class(void)
 {
 	/*
 	 * Document-class: PG::TypeMapByClass < PG::TypeMap

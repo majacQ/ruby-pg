@@ -4,6 +4,7 @@
  */
 
 #include "pg.h"
+#include "pg_util.h"
 
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
@@ -50,11 +51,11 @@ static const rb_data_type_t pg_copycoder_type = {
 		pg_copycoder_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_copycoder_memsize,
-		pg_compact_callback(pg_copycoder_compact),
+		pg_copycoder_compact,
 	},
 	&pg_coder_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -63,9 +64,9 @@ pg_copycoder_encoder_allocate( VALUE klass )
 	t_pg_copycoder *this;
 	VALUE self = TypedData_Make_Struct( klass, t_pg_copycoder, &pg_copycoder_type, this );
 	pg_coder_init_encoder( self );
-	this->typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap, pg_typemap_all_strings);
 	this->delimiter = '\t';
-	this->null_string = rb_str_new_cstr("\\N");
+	RB_OBJ_WRITE(self, &this->null_string, rb_str_new_cstr("\\N"));
 	return self;
 }
 
@@ -75,9 +76,9 @@ pg_copycoder_decoder_allocate( VALUE klass )
 	t_pg_copycoder *this;
 	VALUE self = TypedData_Make_Struct( klass, t_pg_copycoder, &pg_copycoder_type, this );
 	pg_coder_init_decoder( self );
-	this->typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap, pg_typemap_all_strings);
 	this->delimiter = '\t';
-	this->null_string = rb_str_new_cstr("\\N");
+	RB_OBJ_WRITE(self, &this->null_string, rb_str_new_cstr("\\N"));
 	return self;
 }
 
@@ -86,13 +87,16 @@ pg_copycoder_decoder_allocate( VALUE klass )
  *    coder.delimiter = String
  *
  * Specifies the character that separates columns within each row (line) of the file.
- * The default is a tab character in text format, a comma in CSV format.
- * This must be a single one-byte character. This option is ignored when using binary format.
+ * The default is a tab character in text format.
+ * This must be a single one-byte character.
+ *
+ * This option is ignored when using binary format.
  */
 static VALUE
 pg_copycoder_delimiter_set(VALUE self, VALUE delimiter)
 {
 	t_pg_copycoder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	StringValue(delimiter);
 	if(RSTRING_LEN(delimiter) != 1)
 		rb_raise( rb_eArgError, "delimiter size must be one byte");
@@ -114,17 +118,19 @@ pg_copycoder_delimiter_get(VALUE self)
 }
 
 /*
- * Specifies the string that represents a null value. The default is \\N (backslash-N)
- * in text format, and an unquoted empty string in CSV format. You might prefer an
- * empty string even in text format for cases where you don't want to distinguish nulls
- * from empty strings. This option is ignored when using binary format.
+ * Specifies the string that represents a null value.
+ * The default is \\N (backslash-N) in text format.
+ * You might prefer an empty string even in text format for cases where you don't want to distinguish nulls from empty strings.
+ *
+ * This option is ignored when using binary format.
  */
 static VALUE
 pg_copycoder_null_string_set(VALUE self, VALUE null_string)
 {
 	t_pg_copycoder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	StringValue(null_string);
-	this->null_string = null_string;
+	RB_OBJ_WRITE(self, &this->null_string, null_string);
 	return null_string;
 }
 
@@ -154,11 +160,12 @@ pg_copycoder_type_map_set(VALUE self, VALUE type_map)
 {
 	t_pg_copycoder *this = RTYPEDDATA_DATA( self );
 
+	rb_check_frozen(self);
 	if ( !rb_obj_is_kind_of(type_map, rb_cTypeMap) ){
 		rb_raise( rb_eTypeError, "wrong elements type %s (expected some kind of PG::TypeMap)",
 				rb_obj_classname( type_map ) );
 	}
-	this->typemap = type_map;
+	RB_OBJ_WRITE(self, &this->typemap, type_map);
 
 	return type_map;
 }
@@ -205,6 +212,7 @@ pg_copycoder_type_map_get(VALUE self)
  *
  * See also PG::TextDecoder::CopyRow for the decoding direction with
  * PG::Connection#get_copy_data .
+ * And see PG::BinaryEncoder::CopyRow for an encoder of the COPY binary format.
  */
 static int
 pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate, int enc_idx)
@@ -228,7 +236,7 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
 		char *ptr1;
 		char *ptr2;
 		int strlen;
-		int backslashs;
+		int backslashes;
 		VALUE subint;
 		VALUE entry;
 
@@ -279,19 +287,19 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
 					ptr2 = current_out + strlen;
 
 					/* count required backlashs */
-					for(backslashs = 0; ptr1 != ptr2; ptr1++) {
+					for(backslashes = 0; ptr1 != ptr2; ptr1++) {
 						/* Escape backslash itself, newline, carriage return, and the current delimiter character. */
 						if(*ptr1 == '\\' || *ptr1 == '\n' || *ptr1 == '\r' || *ptr1 == this->delimiter){
-							backslashs++;
+							backslashes++;
 						}
 					}
 
 					ptr1 = current_out + strlen;
-					ptr2 = current_out + strlen + backslashs;
+					ptr2 = current_out + strlen + backslashes;
 					current_out = ptr2;
 
 					/* Then store the escaped string on the final position, walking
-					 * right to left, until all backslashs are placed. */
+					 * right to left, until all backslashes are placed. */
 					while( ptr1 != ptr2 ) {
 						*--ptr2 = *--ptr1;
 						if(*ptr1 == '\\' || *ptr1 == '\n' || *ptr1 == '\r' || *ptr1 == this->delimiter){
@@ -303,6 +311,124 @@ pg_text_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermedia
 	}
 	PG_RB_STR_ENSURE_CAPA( *intermediate, 1, current_out, end_capa_ptr );
 	*current_out++ = '\n';
+
+	rb_str_set_len( *intermediate, current_out - RSTRING_PTR(*intermediate) );
+
+	return -1;
+}
+
+
+/*
+ * Document-class: PG::BinaryEncoder::CopyRow < PG::CopyEncoder
+ *
+ * This class encodes one row of arbitrary columns for transmission as COPY data in binary format.
+ * See the {COPY command}[http://www.postgresql.org/docs/current/static/sql-copy.html]
+ * for description of the format.
+ *
+ * It is intended to be used in conjunction with PG::Connection#put_copy_data .
+ *
+ * The columns are expected as Array of values. The single values are encoded as defined
+ * in the assigned #type_map. If no type_map was assigned, all values are converted to
+ * strings by PG::BinaryEncoder::String.
+ *
+ * Example with default type map ( TypeMapAllStrings ):
+ *   conn.exec "create table my_table (a text,b int,c bool)"
+ *   enco = PG::BinaryEncoder::CopyRow.new
+ *   conn.copy_data "COPY my_table FROM STDIN WITH (FORMAT binary)", enco do
+ *     conn.put_copy_data ["astring", "\x00\x00\x00\a", "\x00"]
+ *     conn.put_copy_data ["string2", "\x00\x00\x00*", "\x01"]
+ *   end
+ * This creates +my_table+ and inserts two rows with binary fields.
+ *
+ * The binary format is less portable and less readable than the text format.
+ * It is therefore recommended to either manually assign a type encoder for each column per PG::TypeMapByColumn,
+ * or to make use of PG::BasicTypeMapBasedOnResult to assign them based on the table OIDs.
+ *
+ * Manually assigning a type encoder works per type map like so:
+ *
+ *   conn.exec "create table my_table (a text,b int,c bool)"
+ *   tm = PG::TypeMapByColumn.new( [
+ *     PG::BinaryEncoder::String.new,
+ *     PG::BinaryEncoder::Int4.new,
+ *     PG::BinaryEncoder::Boolean.new] )
+ *   enco = PG::BinaryEncoder::CopyRow.new( type_map: tm )
+ *   conn.copy_data "COPY my_table FROM STDIN WITH (FORMAT binary)", enco do
+ *     conn.put_copy_data ["astring", 7, false]
+ *     conn.put_copy_data ["string2", 42, true]
+ *   end
+ *
+ * See also PG::BinaryDecoder::CopyRow for the decoding direction with
+ * PG::Connection#get_copy_data .
+ * And see PG::TextEncoder::CopyRow for an encoder of the COPY text format.
+ */
+static int
+pg_bin_enc_copy_row(t_pg_coder *conv, VALUE value, char *out, VALUE *intermediate, int enc_idx)
+{
+	t_pg_copycoder *this = (t_pg_copycoder *)conv;
+	int i;
+	t_typemap *p_typemap;
+	char *current_out;
+	char *end_capa_ptr;
+
+	p_typemap = RTYPEDDATA_DATA( this->typemap );
+	p_typemap->funcs.fit_to_query( this->typemap, value );
+
+	/* Allocate a new string with embedded capacity and realloc exponential when needed. */
+	PG_RB_STR_NEW( *intermediate, current_out, end_capa_ptr );
+	PG_ENCODING_SET_NOCHECK(*intermediate, enc_idx);
+
+	/* 2 bytes for number of fields */
+	PG_RB_STR_ENSURE_CAPA( *intermediate, 2, current_out, end_capa_ptr );
+	write_nbo16(RARRAY_LEN(value), current_out);
+	current_out += 2;
+
+	for( i=0; i<RARRAY_LEN(value); i++){
+		int strlen;
+		VALUE subint;
+		VALUE entry;
+		t_pg_coder_enc_func enc_func;
+		static t_pg_coder *p_elem_coder;
+
+		entry = rb_ary_entry(value, i);
+
+		switch(TYPE(entry)){
+			case T_NIL:
+				/* 4 bytes for -1 indicating a NULL value */
+				PG_RB_STR_ENSURE_CAPA( *intermediate, 4, current_out, end_capa_ptr );
+				write_nbo32(-1, current_out);
+				current_out += 4;
+				break;
+			default:
+				p_elem_coder = p_typemap->funcs.typecast_query_param(p_typemap, entry, i);
+				enc_func = pg_coder_enc_func(p_elem_coder);
+
+				/* 1st pass for retiving the required memory space */
+				strlen = enc_func(p_elem_coder, entry, NULL, &subint, enc_idx);
+
+				if( strlen == -1 ){
+					/* we can directly use String value in subint */
+					strlen = RSTRING_LENINT(subint);
+
+					PG_RB_STR_ENSURE_CAPA( *intermediate, 4 + strlen, current_out, end_capa_ptr );
+					/* 4 bytes length */
+					write_nbo32(strlen, current_out);
+					current_out += 4;
+
+					memcpy( current_out, RSTRING_PTR(subint), strlen );
+					current_out += strlen;
+				} else {
+					/* 2nd pass for writing the data to prepared buffer */
+					PG_RB_STR_ENSURE_CAPA( *intermediate, 4 + strlen, current_out, end_capa_ptr );
+					/* 4 bytes length */
+					write_nbo32(strlen, current_out);
+					current_out += 4;
+
+					/* Place the string at current output position. */
+					strlen = enc_func(p_elem_coder, entry, current_out, &subint, enc_idx);
+					current_out += strlen;
+				}
+		}
+	}
 
 	rb_str_set_len( *intermediate, current_out - RSTRING_PTR(*intermediate) );
 
@@ -372,6 +498,7 @@ GetDecimalFromHex(char hex)
  *
  * See also PG::TextEncoder::CopyRow for the encoding direction with
  * PG::Connection#put_copy_data .
+ * And see PG::BinaryDecoder::CopyRow for a decoder of the COPY binary format.
  */
 /*
  * Parse the current line into separate attributes (fields),
@@ -591,9 +718,169 @@ pg_text_dec_copy_row(t_pg_coder *conv, const char *input_line, int len, int _tup
 }
 
 
-void
-init_pg_copycoder()
+static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
+
+/*
+ * Document-class: PG::BinaryDecoder::CopyRow < PG::CopyDecoder
+ *
+ * This class decodes one row of arbitrary columns received as COPY data in binary format.
+ * See the {COPY command}[http://www.postgresql.org/docs/current/static/sql-copy.html]
+ * for description of the format.
+ *
+ * It is intended to be used in conjunction with PG::Connection#get_copy_data .
+ *
+ * The columns are retrieved as Array of values. The single values are decoded as defined
+ * in the assigned #type_map. If no type_map was assigned, all values are converted to
+ * strings by PG::BinaryDecoder::String.
+ *
+ * Example with default type map ( TypeMapAllStrings ):
+ *   conn.exec("CREATE TABLE my_table AS VALUES('astring', 7, FALSE), ('string2', 42, TRUE) ")
+ *
+ *   deco = PG::BinaryDecoder::CopyRow.new
+ *   conn.copy_data "COPY my_table TO STDOUT WITH (FORMAT binary)", deco do
+ *     while row=conn.get_copy_data
+ *       p row
+ *     end
+ *   end
+ * This prints all rows of +my_table+ in binary format:
+ *   ["astring", "\x00\x00\x00\a", "\x00"]
+ *   ["string2", "\x00\x00\x00*", "\x01"]
+ *
+ * Example with column based type map:
+ *   tm = PG::TypeMapByColumn.new( [
+ *     PG::BinaryDecoder::String.new,
+ *     PG::BinaryDecoder::Integer.new,
+ *     PG::BinaryDecoder::Boolean.new] )
+ *   deco = PG::BinaryDecoder::CopyRow.new( type_map: tm )
+ *   conn.copy_data "COPY my_table TO STDOUT WITH (FORMAT binary)", deco do
+ *     while row=conn.get_copy_data
+ *       p row
+ *     end
+ *   end
+ * This prints the rows with type casted columns:
+ *   ["astring", 7, false]
+ *   ["string2", 42, true]
+ *
+ * Instead of manually assigning a type decoder for each column, PG::BasicTypeMapForResults
+ * can be used to assign them based on the table OIDs.
+ *
+ * See also PG::BinaryEncoder::CopyRow for the encoding direction with
+ * PG::Connection#put_copy_data .
+ * And see PG::TextDecoder::CopyRow for a decoder of the COPY text format.
+ */
+static VALUE
+pg_bin_dec_copy_row(t_pg_coder *conv, const char *input_line, int len, int _tuple, int _field, int enc_idx)
 {
+	t_pg_copycoder *this = (t_pg_copycoder *)conv;
+
+	/* Return value: array */
+	VALUE array;
+
+	/* Current field */
+	VALUE field_str;
+
+	int nfields;
+	int expected_fields;
+	int fieldno;
+	char *output_ptr;
+	const char *cur_ptr;
+	const char *line_end_ptr;
+	char *end_capa_ptr;
+	t_typemap *p_typemap;
+
+	p_typemap = RTYPEDDATA_DATA( this->typemap );
+	expected_fields = p_typemap->funcs.fit_to_copy_get( this->typemap );
+
+	/* Allocate a new string with embedded capacity and realloc later with
+	 * exponential growing size when needed. */
+	PG_RB_STR_NEW( field_str, output_ptr, end_capa_ptr );
+
+	/* set pointer variables for loop */
+	cur_ptr = input_line;
+	line_end_ptr = input_line + len;
+
+	if (line_end_ptr - cur_ptr >= 11 && memcmp(cur_ptr, BinarySignature, 11) == 0){
+		/* binary COPY header signature detected -> just drop it */
+		int ext_bytes;
+		cur_ptr += 11;
+
+		/* read flags */
+		if (line_end_ptr - cur_ptr < 4 ) goto length_error;
+		cur_ptr += 4;
+
+		/* read header extensions */
+		if (line_end_ptr - cur_ptr < 4 ) goto length_error;
+		ext_bytes = read_nbo32(cur_ptr);
+		if (ext_bytes < 0) goto length_error;
+		cur_ptr += 4;
+		if (line_end_ptr - cur_ptr < ext_bytes ) goto length_error;
+		cur_ptr += ext_bytes;
+	}
+
+	/* read row header */
+	if (line_end_ptr - cur_ptr < 2 ) goto length_error;
+	nfields = read_nbo16(cur_ptr);
+	cur_ptr += 2;
+
+	/* COPY data trailer? */
+	if (nfields < 0) {
+		if (nfields != -1) goto length_error;
+		array = Qnil;
+	} else {
+		array = rb_ary_new2(expected_fields);
+
+		for( fieldno = 0; fieldno < nfields; fieldno++){
+			long input_len;
+
+			/* read field size */
+			if (line_end_ptr - cur_ptr < 4 ) goto length_error;
+			input_len = read_nbo32(cur_ptr);
+			cur_ptr += 4;
+
+			if (input_len < 0) {
+				if (input_len != -1) goto length_error;
+				/* NULL indicator */
+				rb_ary_push(array, Qnil);
+			} else {
+				VALUE field_value;
+				if (line_end_ptr - cur_ptr < input_len ) goto length_error;
+
+				/* copy input data to field_str */
+				PG_RB_STR_ENSURE_CAPA( field_str, input_len, output_ptr, end_capa_ptr );
+				memcpy(output_ptr, cur_ptr, input_len);
+				cur_ptr += input_len;
+				output_ptr += input_len;
+				/* convert field_str through the type map */
+				rb_str_set_len( field_str, output_ptr - RSTRING_PTR(field_str) );
+				field_value = p_typemap->funcs.typecast_copy_get( p_typemap, field_str, fieldno, 1, enc_idx );
+
+				rb_ary_push(array, field_value);
+
+				if( field_value == field_str ){
+					/* Our output string will be send to the user, so we can not reuse
+					* it for the next field. */
+					PG_RB_STR_NEW( field_str, output_ptr, end_capa_ptr );
+				}
+			}
+
+			/* Reset the pointer to the start of the output/buffer string. */
+			output_ptr = RSTRING_PTR(field_str);
+		}
+	}
+
+	if (cur_ptr < line_end_ptr)
+		rb_raise( rb_eArgError, "trailing data after row data at position: %ld", (long)(cur_ptr - input_line) + 1 );
+
+	return array;
+
+length_error:
+	rb_raise( rb_eArgError, "premature end of COPY data at position: %ld", (long)(cur_ptr - input_line) + 1 );
+}
+
+void
+init_pg_copycoder(void)
+{
+	VALUE coder;
 	/* Document-class: PG::CopyCoder < PG::Coder
 	 *
 	 * This is the base class for all type cast classes for COPY data,
@@ -616,13 +903,19 @@ init_pg_copycoder()
 	/* Make RDoc aware of the encoder classes... */
 	/* rb_mPG_TextEncoder = rb_define_module_under( rb_mPG, "TextEncoder" ); */
 	/* dummy = rb_define_class_under( rb_mPG_TextEncoder, "CopyRow", rb_cPG_CopyEncoder ); */
-	pg_define_coder( "CopyRow", pg_text_enc_copy_row, rb_cPG_CopyEncoder, rb_mPG_TextEncoder );
-	rb_include_module( rb_cPG_CopyEncoder, rb_mPG_BinaryFormatting );
+	coder = pg_define_coder( "CopyRow", pg_text_enc_copy_row, rb_cPG_CopyEncoder, rb_mPG_TextEncoder );
+	rb_include_module( coder, rb_mPG_BinaryFormatting );
+	/* rb_mPG_BinaryEncoder = rb_define_module_under( rb_mPG, "BinaryEncoder" ); */
+	/* dummy = rb_define_class_under( rb_mPG_BinaryEncoder, "CopyRow", rb_cPG_CopyEncoder ); */
+	pg_define_coder( "CopyRow", pg_bin_enc_copy_row, rb_cPG_CopyEncoder, rb_mPG_BinaryEncoder );
 
 	/* rb_mPG_TextDecoder = rb_define_module_under( rb_mPG, "TextDecoder" ); */
 	/* dummy = rb_define_class_under( rb_mPG_TextDecoder, "CopyRow", rb_cPG_CopyDecoder ); */
-	pg_define_coder( "CopyRow", pg_text_dec_copy_row, rb_cPG_CopyDecoder, rb_mPG_TextDecoder );
+	coder = pg_define_coder( "CopyRow", pg_text_dec_copy_row, rb_cPG_CopyDecoder, rb_mPG_TextDecoder );
 	/* Although CopyRow is a text decoder, data can contain zero bytes and are not zero terminated.
 	 * They are handled like binaries. So format is set to 1 (binary). */
-	rb_include_module( rb_cPG_CopyDecoder, rb_mPG_BinaryFormatting );
+	rb_include_module( coder, rb_mPG_BinaryFormatting );
+	/* rb_mPG_BinaryDecoder = rb_define_module_under( rb_mPG, "BinaryDecoder" ); */
+	/* dummy = rb_define_class_under( rb_mPG_BinaryDecoder, "CopyRow", rb_cPG_CopyDecoder ); */
+	pg_define_coder( "CopyRow", pg_bin_dec_copy_row, rb_cPG_CopyDecoder, rb_mPG_BinaryDecoder );
 }

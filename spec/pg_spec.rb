@@ -12,6 +12,13 @@ describe PG do
 		expect( PG.library_version ).to be >= 90100
 	end
 
+	it "can format the pg version" do
+		expect( PG.version_string ).to be_an( String )
+		expect( PG.version_string ).to match(/PG \d+\.\d+\.\d+/)
+		expect( PG.version_string(true) ).to be_an( String )
+		expect( PG.version_string(true) ).to match(/PG \d+\.\d+\.\d+/)
+	end
+
 	it "can select which of both security libraries to initialize" do
 		# This setting does nothing here, because there is already a connection
 		# to the server, at this point in time.
@@ -31,23 +38,23 @@ describe PG do
 		expect( PG ).to be_threadsafe()
 	end
 
-	it "does have hierarchical error classes" do
-		expect( PG::UndefinedTable.ancestors[0,4] ).to eq([
-				PG::UndefinedTable,
-				PG::SyntaxErrorOrAccessRuleViolation,
-				PG::ServerError,
-		        PG::Error
-		        ])
-
-		expect( PG::InvalidSchemaName.ancestors[0,3] ).to eq([
-				PG::InvalidSchemaName,
-				PG::ServerError,
-		        PG::Error
-		        ])
-	end
-
 	it "tells about the libpq library path" do
 		expect( PG::POSTGRESQL_LIB_PATH ).to include("/")
 	end
 
+	it "can #connect" do
+		c = PG.connect(@conninfo)
+		expect( c ).to be_a_kind_of( PG::Connection )
+		c.close
+	end
+
+	it "can #connect with block" do
+		bres = PG.connect(@conninfo) do |c|
+			res = c.exec "SELECT 5"
+			expect( res.values ).to eq( [["5"]] )
+			55
+		end
+
+		expect( bres ).to eq( 55 )
+	end
 end

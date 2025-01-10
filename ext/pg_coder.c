@@ -35,7 +35,7 @@ pg_coder_init_encoder( VALUE self )
 		this->enc_func = NULL;
 	}
 	this->dec_func = NULL;
-	this->coder_obj = self;
+	RB_OBJ_WRITE(self, &this->coder_obj, self);
 	this->oid = 0;
 	this->format = 0;
 	this->flags = 0;
@@ -54,7 +54,7 @@ pg_coder_init_decoder( VALUE self )
 	} else {
 		this->dec_func = NULL;
 	}
-	this->coder_obj = self;
+	RB_OBJ_WRITE(self, &this->coder_obj, self);
 	this->oid = 0;
 	this->format = 0;
 	this->flags = 0;
@@ -95,11 +95,13 @@ const rb_data_type_t pg_coder_type = {
 		(RUBY_DATA_FUNC) NULL,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_coder_memsize,
-		pg_compact_callback(pg_coder_compact),
+		pg_coder_compact,
 	},
 	0,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	// IMPORTANT: WB_PROTECTED objects must only use the RB_OBJ_WRITE()
+	// macro to update VALUE references, as to trigger write barriers.
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -117,11 +119,11 @@ static const rb_data_type_t pg_composite_coder_type = {
 		(RUBY_DATA_FUNC) NULL,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_composite_coder_memsize,
-		pg_compact_callback(pg_composite_coder_compact),
+		pg_composite_coder_compact,
 	},
 	&pg_coder_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -133,6 +135,7 @@ pg_composite_encoder_allocate( VALUE klass )
 	this->elem = NULL;
 	this->needs_quotation = 1;
 	this->delimiter = ',';
+	this->dimensions = -1;
 	rb_iv_set( self, "@elements_type", Qnil );
 	return self;
 }
@@ -155,6 +158,7 @@ pg_composite_decoder_allocate( VALUE klass )
 	this->elem = NULL;
 	this->needs_quotation = 1;
 	this->delimiter = ',';
+	this->dimensions = -1;
 	rb_iv_set( self, "@elements_type", Qnil );
 	return self;
 }
@@ -173,7 +177,7 @@ static VALUE
 pg_coder_encode(int argc, VALUE *argv, VALUE self)
 {
 	VALUE res;
-	VALUE intermediate;
+	VALUE intermediate = Qnil;
 	VALUE value;
 	int len, len2;
 	int enc_idx;
@@ -210,8 +214,6 @@ pg_coder_encode(int argc, VALUE *argv, VALUE self)
 			rb_obj_classname( self ), len, len2 );
 	}
 	rb_str_set_len( res, len2 );
-
-	RB_GC_GUARD(intermediate);
 
 	return res;
 }
@@ -273,6 +275,7 @@ static VALUE
 pg_coder_oid_set(VALUE self, VALUE oid)
 {
 	t_pg_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	this->oid = NUM2UINT(oid);
 	return oid;
 }
@@ -304,6 +307,7 @@ static VALUE
 pg_coder_format_set(VALUE self, VALUE format)
 {
 	t_pg_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	this->format = NUM2INT(format);
 	return format;
 }
@@ -335,6 +339,7 @@ static VALUE
 pg_coder_flags_set(VALUE self, VALUE flags)
 {
 	t_pg_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	this->flags = NUM2INT(flags);
 	return flags;
 }
@@ -366,6 +371,7 @@ static VALUE
 pg_coder_needs_quotation_set(VALUE self, VALUE needs_quotation)
 {
 	t_pg_composite_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	this->needs_quotation = RTEST(needs_quotation);
 	return needs_quotation;
 }
@@ -396,6 +402,7 @@ static VALUE
 pg_coder_delimiter_set(VALUE self, VALUE delimiter)
 {
 	t_pg_composite_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
 	StringValue(delimiter);
 	if(RSTRING_LEN(delimiter) != 1)
 		rb_raise( rb_eArgError, "delimiter size must be one byte");
@@ -418,6 +425,49 @@ pg_coder_delimiter_get(VALUE self)
 
 /*
  * call-seq:
+ *    coder.dimensions = Integer
+ *    coder.dimensions = nil
+ *
+ * Set number of array dimensions to be encoded.
+ *
+ * This property ensures, that this number of dimensions is always encoded.
+ * If less dimensions than this number are in the given value, an ArgumentError is raised.
+ * If more dimensions than this number are in the value, the Array value is passed to the next encoder.
+ *
+ * Setting dimensions is especially useful, when a Record shall be encoded into an Array, since the Array encoder can not distinguish if the array shall be encoded as a higher dimension or as a record otherwise.
+ *
+ * The default is +nil+.
+ *
+ * See #dimensions
+ */
+static VALUE
+pg_coder_dimensions_set(VALUE self, VALUE dimensions)
+{
+	t_pg_composite_coder *this = RTYPEDDATA_DATA(self);
+	rb_check_frozen(self);
+	if(!NIL_P(dimensions) && NUM2INT(dimensions) < 0)
+		rb_raise( rb_eArgError, "dimensions must be nil or >= 0");
+	this->dimensions = NIL_P(dimensions) ? -1 : NUM2INT(dimensions);
+	return dimensions;
+}
+
+/*
+ * call-seq:
+ *    coder.dimensions -> Integer | nil
+ *
+ * Get number of enforced array dimensions or +nil+ if not set.
+ *
+ * See #dimensions=
+ */
+static VALUE
+pg_coder_dimensions_get(VALUE self)
+{
+	t_pg_composite_coder *this = RTYPEDDATA_DATA(self);
+	return this->dimensions < 0 ? Qnil : INT2NUM(this->dimensions);
+}
+
+/*
+ * call-seq:
  *    coder.elements_type = coder
  *
  * Specifies the PG::Coder object that is used to encode or decode
@@ -430,6 +480,7 @@ pg_coder_elements_type_set(VALUE self, VALUE elem_type)
 {
 	t_pg_composite_coder *this = RTYPEDDATA_DATA( self );
 
+	rb_check_frozen(self);
 	if ( NIL_P(elem_type) ){
 		this->elem = NULL;
 	} else if ( rb_obj_is_kind_of(elem_type, rb_cPG_Coder) ){
@@ -452,10 +503,10 @@ static const rb_data_type_t pg_coder_cfunc_type = {
 	},
 	0,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
-void
+VALUE
 pg_define_coder( const char *name, void *func, VALUE base_klass, VALUE nsp )
 {
 	VALUE cfunc_obj = TypedData_Wrap_Struct( rb_cObject, &pg_coder_cfunc_type, func );
@@ -468,9 +519,10 @@ pg_define_coder( const char *name, void *func, VALUE base_klass, VALUE nsp )
 	if( nsp==rb_mPG_BinaryDecoder || nsp==rb_mPG_TextDecoder )
 		rb_define_method( coder_klass, "decode", pg_coder_decode, -1 );
 
-	rb_define_const( coder_klass, "CFUNC", cfunc_obj );
+	rb_define_const( coder_klass, "CFUNC", rb_obj_freeze(cfunc_obj) );
 
 	RB_GC_GUARD(cfunc_obj);
+	return coder_klass;
 }
 
 
@@ -537,7 +589,7 @@ pg_coder_dec_func(t_pg_coder *this, int binary)
 
 
 void
-init_pg_coder()
+init_pg_coder(void)
 {
 	s_id_encode = rb_intern("encode");
 	s_id_decode = rb_intern("decode");
@@ -595,6 +647,8 @@ init_pg_coder()
 	 *
 	 * This is the base class for all type cast classes of PostgreSQL types,
 	 * that are made up of some sub type.
+	 *
+	 * See PG::TextEncoder::Array, PG::TextDecoder::Array, PG::BinaryEncoder::Array, PG::BinaryDecoder::Array, etc.
 	 */
 	rb_cPG_CompositeCoder = rb_define_class_under( rb_mPG, "CompositeCoder", rb_cPG_Coder );
 	rb_define_method( rb_cPG_CompositeCoder, "elements_type=", pg_coder_elements_type_set, 1 );
@@ -603,6 +657,8 @@ init_pg_coder()
 	rb_define_method( rb_cPG_CompositeCoder, "needs_quotation?", pg_coder_needs_quotation_get, 0 );
 	rb_define_method( rb_cPG_CompositeCoder, "delimiter=", pg_coder_delimiter_set, 1 );
 	rb_define_method( rb_cPG_CompositeCoder, "delimiter", pg_coder_delimiter_get, 0 );
+	rb_define_method( rb_cPG_CompositeCoder, "dimensions=", pg_coder_dimensions_set, 1 );
+	rb_define_method( rb_cPG_CompositeCoder, "dimensions", pg_coder_dimensions_get, 0 );
 
 	/* Document-class: PG::CompositeEncoder < PG::CompositeCoder */
 	rb_cPG_CompositeEncoder = rb_define_class_under( rb_mPG, "CompositeEncoder", rb_cPG_CompositeCoder );

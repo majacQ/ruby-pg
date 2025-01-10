@@ -1,17 +1,39 @@
-name: Build and test binary gems
+name: Binary gems
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 3" # At 05:00 on Wednesday # https://crontab.guru/#0_5_*_*_3
+  push:
+    branches:
+      - master
+    tags:
+      - "*.*.*"
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - "*"
+permissions:
+  contents: read
 
 jobs:
-  job_build_x64:
-    name: build
+  rcd_build:
+    name: Build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "x64-mingw-ucrt"
+          - platform: "x64-mingw32"
+          - platform: "x86-mingw32"
+          - platform: "x86_64-linux"
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.0"
+          ruby-version: "3.3"
       - run: bundle install
 
       - name: Create a dummy cert to satisfy the build
@@ -22,59 +44,153 @@ jobs:
           cp gem-public_cert.pem ~/.gem/gem-public_cert.pem
 
       - name: Build binary gem
-        run: bundle exec rake gem:windows:x64-mingw32
+        run: bundle exec rake gem:native:${{ matrix.platform }}
 
       - name: Upload binary gem
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
-          name: binary-gem
+          name: binary-gem-${{ matrix.platform }}
           path: pkg/*.gem
 
   job_test_binary:
-    name: Test on Windows
-    needs: job_build_x64
+    name: Test
+    needs: rcd_build
     strategy:
       fail-fast: false
       matrix:
         include:
-          - ruby: "3.0"
-            PGVERSION: 14.0-1-windows-x64
-            PGVER: "14"
-          - ruby: "2.5"
-            PGVERSION: 10.16-1-windows
-            PGVER: "10"
+          - os: windows-latest
+            ruby: "3.3"
+            platform: "x64-mingw-ucrt"
+          - os: windows-latest
+            ruby: "3.1.4-1"
+            platform: "x86-mingw32"
+            PGVERSION: 10.20-1-windows
+          - os: windows-latest
+            ruby: "2.7"
+            platform: "x64-mingw32"
+            PGVERSION: 16.6-1-windows-x64
+          - os: ubuntu-latest
+            ruby: "3.2"
+            platform: "x86_64-linux"
 
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     env:
       PGVERSION: ${{ matrix.PGVERSION }}
-      PGVER: ${{ matrix.PGVER }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
+        if: matrix.platform != 'x86-mingw32'
+        uses: ruby/setup-ruby-pkgs@v1
         with:
           ruby-version: ${{ matrix.ruby }}
+          apt-get: "postgresql" # Ubuntu
+          brew: "postgresql"    # macOS
+          mingw: "postgresql"   # Windows mingw / mswin /ucrt
+
+      - name: Set up 32 bit x86 Ruby
+        if: matrix.platform == 'x86-mingw32'
+        run: |
+          $(new-object net.webclient).DownloadFile("https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-${{ matrix.ruby }}/rubyinstaller-${{ matrix.ruby }}-x86.exe", "$pwd/ruby-setup.exe")
+          cmd /c ruby-setup.exe /currentuser /verysilent /dir=C:/Ruby-${{ matrix.ruby }}
+          echo "c:/ruby-${{ matrix.ruby }}/bin"  | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          c:/ruby-${{ matrix.ruby }}/bin/ridk enable
+          c:/msys64/usr/bin/bash -lc "pacman -S --noconfirm --needed make `${MINGW_PACKAGE_PREFIX}-pkgconf `${MINGW_PACKAGE_PREFIX}-libyaml `${MINGW_PACKAGE_PREFIX}-gcc `${MINGW_PACKAGE_PREFIX}-make"
+          echo "C:/msys64/$env:MSYSTEM_PREFIX/bin"  | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Download gem from build job
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
-          name: binary-gem
+          name: binary-gem-${{ matrix.platform }}
 
-      - name: Download PostgreSQL
+      - name: Download PostgreSQL 32-bit
+        if: ${{ matrix.os == 'windows-latest' && matrix.PGVERSION }}
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           function Unzip {
               param([string]$zipfile, [string]$outpath)
               [System.IO.Compression.ZipFile]::ExtractToDirectory($zipfile, $outpath)
           }
-
           $(new-object net.webclient).DownloadFile("http://get.enterprisedb.com/postgresql/postgresql-$env:PGVERSION-binaries.zip", "postgresql-binaries.zip")
           Unzip "postgresql-binaries.zip" "."
           echo "$pwd/pgsql/bin"  | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: set PGUSER
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
           echo "PGUSER=$env:USERNAME"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "PGPASSWORD="  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - run: echo $env:PATH
+      - run: gem update --system 3.3.26
       - run: bundle install
-      - run: gem install --local *.gem --verbose
+      - run: gem install --local pg-*${{ matrix.platform }}.gem --verbose
       - name: Run specs
-        run: ruby -rpg -S rspec spec/**/*_spec.rb
+        if: ${{ matrix.os != 'windows-latest' }}
+        run: ruby -rpg -S rspec -fd spec/**/*_spec.rb
+      - name: Run specs
+        if: ${{ matrix.os == 'windows-latest' }}
+        run: |
+          ridk enable
+          ruby -rpg -S rspec -fd spec/**/*_spec.rb
+
+      - name: Print logs if job failed
+        if: ${{ failure() && matrix.os == 'windows-latest' }}
+        run: |
+          ridk enable
+          find "$(ruby -e"puts RbConfig::CONFIG[%q[libdir]]")" -name mkmf.log -print0 | xargs -0 cat
+          find -name setup.log  -print0 | xargs -0 cat
+
+
+  job_binary_multiarch:
+    name: multiarch (${{matrix.platform}} on ${{matrix.from_image}} ${{matrix.image_platform}})
+    needs: rcd_build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - from_image: fedora:39
+            image_platform: linux/x86_64
+            gem_platform: x86_64-linux
+            dockerfile: centos
+          - from_image: alpine
+            image_platform: linux/x86_64
+            gem_platform: x86_64-linux
+            dockerfile: alpine
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download gem-${{ matrix.gem_platform }}
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-gem-${{ matrix.gem_platform }}
+      - name: Build image and Run tests
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          docker build --rm --platform ${{matrix.image_platform}} --build-arg from_image=${{matrix.from_image}} -t ruby-test -f spec/env/Dockerfile.${{matrix.dockerfile}} .
+          docker run --rm -t --network=host -v `pwd`:/build ruby-test
+
+  job_binary_yugabyte:
+    name: yugabyte (${{matrix.gem_platform}}
+    needs: rcd_build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gem_platform: x86_64-linux
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download gem-${{ matrix.gem_platform }}
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-gem-${{ matrix.gem_platform }}
+      - name: Build image and Run tests
+        run: |
+          sudo apt-get install -y docker-compose
+          cp -v  pg-*.gem   misc/yugabyte/
+          cd misc/yugabyte
+          docker-compose up --abort-on-container-exit  --exit-code-from pg

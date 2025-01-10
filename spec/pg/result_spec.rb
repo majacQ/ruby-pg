@@ -4,10 +4,46 @@
 require_relative '../helpers'
 
 require 'pg'
-require 'objspace'
 
 
 describe PG::Result do
+
+	it "provides res_status" do
+		str = PG::Result.res_status(PG::PGRES_EMPTY_QUERY)
+		expect( str ).to eq("PGRES_EMPTY_QUERY")
+		expect( str.encoding ).to eq(Encoding::UTF_8)
+
+		res = @conn.exec("SELECT 1")
+		expect( res.res_status ).to eq("PGRES_TUPLES_OK")
+		expect( res.res_status(PG::PGRES_FATAL_ERROR) ).to eq("PGRES_FATAL_ERROR")
+
+		expect{ res.res_status(1,2) }.to raise_error(ArgumentError)
+	end
+
+	it "should deny changes when frozen" do
+		res = @conn.exec("SELECT 1").freeze
+		expect{ res.type_map = PG::TypeMapAllStrings.new }.to raise_error(FrozenError)
+		expect{ res.field_name_type = :symbol  }.to raise_error(FrozenError)
+		expect{ res.clear }.to raise_error(FrozenError)
+	end
+
+	it "should be shareable for Ractor", :ractor do
+		res = @conn.exec("SELECT 1")
+		Ractor.make_shareable(res)
+	end
+
+	it "should be usable with Ractor", :ractor do
+		res = Ractor.new(@conninfo) do |conninfo|
+			conn = PG.connect(conninfo)
+			conn.exec("SELECT 123 as col")
+		ensure
+			conn&.finish
+		end.take
+
+		expect( res ).to be_kind_of( PG::Result )
+		expect( res.fields ).to eq( ["col"] )
+		expect( res.values ).to eq( [["123"]] )
+	end
 
 	describe :field_name_type do
 		let!(:res) { @conn.exec('SELECT 1 AS a, 2 AS "B"') }
@@ -92,144 +128,191 @@ describe PG::Result do
 		expect( res.each.to_a ).to eq [{:a=>'1', :b=>'2'}]
 	end
 
-	context "result streaming in single row mode" do
-		let!(:textdec_int){ PG::TextDecoder::Integer.new name: 'INT4', oid: 23 }
+	[[:single, nil, [:set_single_row_mode]], [:chunked, :postgresql_17, [:set_chunked_rows_mode, 3]]].each do |mode_name, guard, row_mode|
+		context "result streaming in #{mode_name} row mode", guard do
+			let!(:textdec_int){ PG::TextDecoder::Integer.new name: 'INT4', oid: 23 }
 
-		it "can iterate over all rows as Hash" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
-			expect(
-				@conn.get_result.stream_each.to_a
-			).to eq(
-				[{'a'=>"2"}, {'a'=>"3"}, {'a'=>"4"}]
-			)
-			expect(
-				@conn.get_result.enum_for(:stream_each).to_a
-			).to eq(
-				[{'b'=>"1", 'c'=>"5"}, {'b'=>"1", 'c'=>"6"}]
-			)
-			expect( @conn.get_result ).to be_nil
-		end
+			it "can iterate over all rows as Hash" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
+				@conn.send(*row_mode)
+				expect(
+					@conn.get_result.stream_each.to_a
+				).to eq(
+					[{'a'=>"2"}, {'a'=>"3"}, {'a'=>"4"}]
+				)
+				expect(
+					@conn.get_result.enum_for(:stream_each).to_a
+				).to eq(
+					[{'b'=>"1", 'c'=>"5"}, {'b'=>"1", 'c'=>"6"}]
+				)
+				expect( @conn.get_result ).to be_nil
+			end
 
-		it "can iterate over all rows as Hash with symbols and typemap" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
-			res = @conn.get_result.field_names_as(:symbol)
-			res.type_map = PG::TypeMapByColumn.new [textdec_int]
-			expect(
-				res.stream_each.to_a
-			).to eq(
-				[{:a=>2}, {:a=>3}, {:a=>4}]
-			)
-			expect( @conn.get_result ).to be_nil
-		end
+			it "can iterate over all rows as Hash with symbols and typemap" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a" )
+				@conn.send(*row_mode)
+				res = @conn.get_result.field_names_as(:symbol)
+				res.type_map = PG::TypeMapByColumn.new [textdec_int]
+				expect(
+					res.stream_each.to_a
+				).to eq(
+					[{:a=>2}, {:a=>3}, {:a=>4}]
+				)
+				expect( @conn.get_result ).to be_nil
+			end
 
-		it "keeps last result on error while iterating stream_each" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
-			res = @conn.get_result
-			expect do
-				res.stream_each_row do
-					raise ZeroDivisionError
-				end
-			end.to raise_error(ZeroDivisionError)
-			expect( res.values ).to eq([["2"]])
-		end
+			it "keeps last result on error while iterating stream_each" do
+				@conn.send_query( "SELECT generate_series(2,6) AS a" )
+				@conn.send(*row_mode)
+				res = @conn.get_result
+				expect do
+					res.stream_each_row do
+						raise ZeroDivisionError
+					end
+				end.to raise_error(ZeroDivisionError)
+				expect( res.values ).to eq(mode_name==:single ? [["2"]] : [["2"], ["3"], ["4"]])
+			end
 
-		it "can iterate over all rows as Array" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
-			expect(
-				@conn.get_result.enum_for(:stream_each_row).to_a
-			).to eq(
-				[["2"], ["3"], ["4"]]
-			)
-			expect(
-				@conn.get_result.stream_each_row.to_a
-			).to eq(
-				[["1", "5"], ["1", "6"]]
-			)
-			expect( @conn.get_result ).to be_nil
-		end
+			it "can iterate over all rows as Array" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
+				@conn.send(*row_mode)
+				expect(
+					@conn.get_result.enum_for(:stream_each_row).to_a
+				).to eq(
+					[["2"], ["3"], ["4"]]
+				)
+				expect(
+					@conn.get_result.stream_each_row.to_a
+				).to eq(
+					[["1", "5"], ["1", "6"]]
+				)
+				expect( @conn.get_result ).to be_nil
+			end
 
-		it "keeps last result on error while iterating stream_each_row" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
-			res = @conn.get_result
-			expect do
-				res.stream_each_row do
-					raise ZeroDivisionError
-				end
-			end.to raise_error(ZeroDivisionError)
-			expect( res.values ).to eq([["2"]])
-		end
+			it "keeps last result on error while iterating stream_each_row" do
+				@conn.send_query( "SELECT generate_series(2,6) AS a" )
+				@conn.send(*row_mode)
+				res = @conn.get_result
+				expect do
+					res.stream_each_row do
+						raise ZeroDivisionError
+					end
+				end.to raise_error(ZeroDivisionError)
+				expect( res.values ).to eq(mode_name==:single ? [["2"]] : [["2"], ["3"], ["4"]])
+			end
 
-		it "can iterate over all rows as PG::Tuple" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
-			@conn.set_single_row_mode
-			tuples = @conn.get_result.stream_each_tuple.to_a
-			expect( tuples[0][0] ).to eq( "2" )
-			expect( tuples[1]["a"] ).to eq( "3" )
-			expect( tuples.size ).to eq( 3 )
+			it "can iterate over all rows as PG::Tuple" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a; SELECT 1 AS b, generate_series(5,6) AS c" )
+				@conn.send(*row_mode)
+				tuples = @conn.get_result.stream_each_tuple.to_a
+				expect( tuples[0][0] ).to eq( "2" )
+				expect( tuples[1]["a"] ).to eq( "3" )
+				expect( tuples.size ).to eq( 3 )
 
-			tuples = @conn.get_result.enum_for(:stream_each_tuple).to_a
-			expect( tuples[-1][-1] ).to eq( "6" )
-			expect( tuples[-2]["b"] ).to eq( "1" )
-			expect( tuples.size ).to eq( 2 )
+				tuples = @conn.get_result.enum_for(:stream_each_tuple).to_a
+				expect( tuples[-1][-1] ).to eq( "6" )
+				expect( tuples[-2]["b"] ).to eq( "1" )
+				expect( tuples.size ).to eq( 2 )
 
-			expect( @conn.get_result ).to be_nil
-		end
+				expect( @conn.get_result ).to be_nil
+			end
 
-		it "clears result on error while iterating stream_each_tuple" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
-			res = @conn.get_result
-			expect do
-				res.stream_each_tuple do
-					raise ZeroDivisionError
-				end
-			end.to raise_error(ZeroDivisionError)
-			expect( res.cleared? ).to eq(true)
-		end
+			it "clears result on error while iterating stream_each_tuple" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a" )
+				@conn.send(*row_mode)
+				res = @conn.get_result
+				expect do
+					res.stream_each_tuple do
+						raise ZeroDivisionError
+					end
+				end.to raise_error(ZeroDivisionError)
+				expect( res.cleared? ).to eq(true)
+			end
 
-		it "should reuse field names in stream_each_tuple" do
-			@conn.send_query( "SELECT generate_series(2,3) AS a" )
-			@conn.set_single_row_mode
-			tuple1, tuple2 = *@conn.get_result.stream_each_tuple.to_a
-			expect( tuple1.keys[0].object_id ).to eq(tuple2.keys[0].object_id)
-		end
+			it "should reuse field names in stream_each_tuple" do
+				@conn.send_query( "SELECT generate_series(2,3) AS a" )
+				@conn.send(*row_mode)
+				tuple1, tuple2 = *@conn.get_result.stream_each_tuple.to_a
+				expect( tuple1.keys[0].object_id ).to eq(tuple2.keys[0].object_id)
+			end
 
-		it "can iterate over all rows as PG::Tuple with symbols and typemap" do
-			@conn.send_query( "SELECT generate_series(2,4) AS a" )
-			@conn.set_single_row_mode
-			res = @conn.get_result.field_names_as(:symbol)
-			res.type_map = PG::TypeMapByColumn.new [textdec_int]
-			tuples = res.stream_each_tuple.to_a
-			expect( tuples[0][0] ).to eq( 2 )
-			expect( tuples[1][:a] ).to eq( 3 )
-			expect( @conn.get_result ).to be_nil
-		end
+			it "can iterate over all rows as PG::Tuple with symbols and typemap" do
+				@conn.send_query( "SELECT generate_series(2,4) AS a" )
+				@conn.send(*row_mode)
+				res = @conn.get_result.field_names_as(:symbol)
+				res.type_map = PG::TypeMapByColumn.new [textdec_int]
+				tuples = res.stream_each_tuple.to_a
+				expect( tuples[0][0] ).to eq( 2 )
+				expect( tuples[1][:a] ).to eq( 3 )
+				expect( @conn.get_result ).to be_nil
+			end
 
-		it "complains when not in single row mode" do
-			@conn.send_query( "SELECT generate_series(2,4)" )
-			expect{
-				@conn.get_result.stream_each_row.to_a
-			}.to raise_error(PG::InvalidResultStatus, /not in single row mode/)
-		end
+			it "can handle commands not returning tuples" do
+				@conn.send_query( "CREATE TEMP TABLE test_single_row_mode (a int)" )
+				@conn.send(*row_mode)
+				res1 = @conn.get_result
+				res2 = res1.stream_each_tuple { raise "this shouldn't be called" }
+				expect( res2 ).to be_equal( res1 )
+				expect( @conn.get_result ).to be_nil
+				@conn.exec( "DROP TABLE test_single_row_mode" )
+			end
 
-		it "complains when intersected with get_result" do
-			@conn.send_query( "SELECT 1" )
-			@conn.set_single_row_mode
-			expect{
-				@conn.get_result.stream_each_row.each{ @conn.get_result }
-			}.to raise_error(PG::NoResultError, /no result received/)
-		end
+			it "complains when not in single row mode" do
+				@conn.send_query( "SELECT generate_series(2,4)" )
+				expect{
+					@conn.get_result.stream_each_row.to_a
+				}.to raise_error(PG::InvalidResultStatus, /not in single row mode/)
+			end
 
-		it "raises server errors" do
-			@conn.send_query( "SELECT 0/0" )
-			expect{
-				@conn.get_result.stream_each_row.to_a
-			}.to raise_error(PG::DivisionByZero)
+			it "complains when intersected with get_result" do
+				@conn.send_query( "SELECT 1" )
+				@conn.send(*row_mode)
+				expect{
+					@conn.get_result.stream_each_row.each{ @conn.get_result }
+				}.to raise_error(PG::NoResultError, /no result received/)
+			end
+
+			it "raises server errors" do
+				@conn.send_query( "SELECT 0/0" )
+				expect{
+					@conn.get_result.stream_each_row.to_a
+				}.to raise_error(PG::DivisionByZero)
+			end
+
+			it "raises an error if result number of fields change" do
+				@conn.send_query( "SELECT 1" )
+				@conn.send(*row_mode)
+				res = @conn.get_result
+				expect{
+					res.stream_each_row do
+						@conn.discard_results
+						@conn.send_query("SELECT 2,3");
+						@conn.send(*row_mode)
+					end
+				}.to raise_error(PG::InvalidChangeOfResultFields, /from 1 to 2 /)
+				expect( res.cleared? ).to be true
+			end
+
+			it "raises an error if there is a timeout during streaming" do
+				@conn.exec( "SET local statement_timeout = 20" )
+
+				@conn.send_query( "SELECT 1, true UNION ALL SELECT 2, (pg_sleep(0.3) IS NULL)" )
+				@conn.send(*row_mode)
+				expect{
+					@conn.get_result.stream_each_row do |row|
+						# No-op
+					end
+				}.to raise_error(PG::QueryCanceled, /statement timeout/)
+			end
+
+			it "should deny streaming when frozen" do
+				@conn.send_query( "SELECT 1" )
+				@conn.send(*row_mode)
+				res = @conn.get_result.freeze
+				expect{
+					res.stream_each_row
+				}.to raise_error(FrozenError)
+			end
 		end
 	end
 
@@ -241,7 +324,7 @@ describe PG::Result do
 	it "encapsulates errors in a PG::Error object" do
 		exception = nil
 		begin
-			@conn.exec( "SELECT * FROM nonexistant_table" )
+			@conn.exec( "SELECT * FROM nonexistent_table" )
 		rescue PG::Error => err
 			exception = err
 		end
@@ -253,7 +336,7 @@ describe PG::Result do
 		expect( result.error_field(PG::PG_DIAG_SQLSTATE) ).to eq( '42P01' )
 		expect(
 			result.error_field(PG::PG_DIAG_MESSAGE_PRIMARY)
-		).to eq( 'relation "nonexistant_table" does not exist' )
+		).to eq( 'relation "nonexistent_table" does not exist' )
 		expect( result.error_field(PG::PG_DIAG_MESSAGE_DETAIL) ).to be_nil()
 		expect( result.error_field(PG::PG_DIAG_MESSAGE_HINT) ).to be_nil()
 		expect( result.error_field(PG::PG_DIAG_STATEMENT_POSITION) ).to eq( '15' )
@@ -269,10 +352,10 @@ describe PG::Result do
 		).to match( /^parserOpenTable$|^RangeVarGetRelid$/ )
 	end
 
-	it "encapsulates PG_DIAG_SEVERITY_NONLOCALIZED error in a PG::Error object", :postgresql_96 do
+	it "encapsulates PG_DIAG_SEVERITY_NONLOCALIZED error in a PG::Error object" do
 		result = nil
 		begin
-			@conn.exec( "SELECT * FROM nonexistant_table" )
+			@conn.exec( "SELECT * FROM nonexistent_table" )
 		rescue PG::Error => err
 			result = err.result
 		end
@@ -314,7 +397,7 @@ describe PG::Result do
 		expect( res.result_error_message ).to match(/"xyz"/)
 	end
 
-	it "provides a verbose error message", :postgresql_96 do
+	it "provides a verbose error message" do
 		@conn.send_query("SELECT xyz")
 		res = @conn.get_result; @conn.get_result
 		# PQERRORS_TERSE should give a single line result
@@ -411,6 +494,27 @@ describe PG::Result do
 
 		res = @conn.exec( 'SELECT * FROM valuestest' )
 		expect( res.values ).to eq( [ ["bar"], ["bar2"] ] )
+	end
+
+	it "provides the result status" do
+		res = @conn.exec("SELECT 1")
+		expect( res.result_status ).to eq(PG::PGRES_TUPLES_OK)
+
+		res = @conn.exec("")
+		expect( res.result_status ).to eq(PG::PGRES_EMPTY_QUERY)
+	end
+
+	it "can retrieve number of fields" do
+		res = @conn.exec('SELECT 1 AS a, 2 AS "B"')
+		expect(res.nfields).to eq(2)
+		expect(res.num_fields).to eq(2)
+	end
+
+	it "can retrieve fields format (text/binary)" do
+		res = @conn.exec_params('SELECT 1 AS a, 2 AS "B"', [], 0)
+		expect(res.binary_tuples).to eq(0)
+		res = @conn.exec_params('SELECT 1 AS a, 2 AS "B"', [], 1)
+		expect(res.binary_tuples).to eq(1)
 	end
 
 	it "can retrieve field names" do
@@ -525,11 +629,11 @@ describe PG::Result do
 	end
 
 	it "can be manually checked for failed result status (async API)" do
-		@conn.send_query( "SELECT * FROM nonexistant_table" )
+		@conn.send_query( "SELECT * FROM nonexistent_table" )
 		res = @conn.get_result
 		expect {
 			res.check
-		}.to raise_error( PG::Error, /relation "nonexistant_table" does not exist/ )
+		}.to raise_error( PG::Error, /relation "nonexistent_table" does not exist/ )
 	end
 
 	it "can return the values of a single field" do
@@ -559,20 +663,20 @@ describe PG::Result do
 		expect{ res.tuple("x") }.to raise_error(TypeError)
 	end
 
-	it "raises a proper exception for a nonexistant table" do
+	it "raises a proper exception for a nonexistent table" do
 		expect {
-			@conn.exec( "SELECT * FROM nonexistant_table" )
-		}.to raise_error( PG::UndefinedTable, /relation "nonexistant_table" does not exist/ )
+			@conn.exec( "SELECT * FROM nonexistent_table" )
+		}.to raise_error( PG::UndefinedTable, /relation "nonexistent_table" does not exist/ )
 	end
 
 	it "raises a more generic exception for an unknown SQLSTATE" do
 		old_error = PG::ERROR_CLASSES.delete('42P01')
 		begin
 			expect {
-				@conn.exec( "SELECT * FROM nonexistant_table" )
+				@conn.exec( "SELECT * FROM nonexistent_table" )
 			}.to raise_error{|error|
 				expect( error ).to be_an_instance_of(PG::SyntaxErrorOrAccessRuleViolation)
-				expect( error.to_s ).to match(/relation "nonexistant_table" does not exist/)
+				expect( error.to_s ).to match(/relation "nonexistent_table" does not exist/)
 			}
 		ensure
 			PG::ERROR_CLASSES['42P01'] = old_error
@@ -584,10 +688,10 @@ describe PG::Result do
 		old_error2 = PG::ERROR_CLASSES.delete('42')
 		begin
 			expect {
-				@conn.exec( "SELECT * FROM nonexistant_table" )
+				@conn.exec( "SELECT * FROM nonexistent_table" )
 			}.to raise_error{|error|
 				expect( error ).to be_an_instance_of(PG::ServerError)
-				expect( error.to_s ).to match(/relation "nonexistant_table" does not exist/)
+				expect( error.to_s ).to match(/relation "nonexistent_table" does not exist/)
 			}
 		ensure
 			PG::ERROR_CLASSES['42P01'] = old_error1
@@ -595,10 +699,10 @@ describe PG::Result do
 		end
 	end
 
-	it "raises a proper exception for a nonexistant schema" do
+	it "raises a proper exception for a nonexistent schema" do
 		expect {
-			@conn.exec( "DROP SCHEMA nonexistant_schema" )
-		}.to raise_error( PG::InvalidSchemaName, /schema "nonexistant_schema" does not exist/ )
+			@conn.exec( "DROP SCHEMA nonexistent_schema" )
+		}.to raise_error( PG::InvalidSchemaName, /schema "nonexistent_schema" does not exist/ )
 	end
 
 	it "the raised result is nil in case of a connection error" do

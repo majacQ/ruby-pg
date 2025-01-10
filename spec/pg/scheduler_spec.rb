@@ -3,59 +3,12 @@
 
 require_relative '../helpers'
 
+# Work around ruby bug: https://bugs.ruby-lang.org/issues/19562
+''.encode(Encoding::ISO8859_3)
+
 $scheduler_timeout = false
 
 context "with a Fiber scheduler", :scheduler do
-
-	def setup
-		# Run examples with gated scheduler
-		sched = Helpers::TcpGateScheduler.new(external_host: 'localhost', external_port: ENV['PGPORT'].to_i, debug: ENV['PG_DEBUG']=='1')
-		Fiber.set_scheduler(sched)
-		@conninfo_gate = @conninfo.gsub(/(^| )port=\d+/, " port=#{sched.internal_port}")
-
-		# Run examples with default scheduler
-		#Fiber.set_scheduler(Helpers::Scheduler.new)
-		#@conninfo_gate = @conninfo
-
-		# Run examples without scheduler
-		#def Fiber.schedule; yield; end
-		#@conninfo_gate = @conninfo
-	end
-
-	def teardown
-		Fiber.set_scheduler(nil)
-	end
-
-	def stop_scheduler
-		if Fiber.scheduler && Fiber.scheduler.respond_to?(:finish)
-			Fiber.scheduler.finish
-		end
-	end
-
-	def thread_with_timeout(timeout)
-		th = Thread.new do
-			yield
-		end
-		unless th.join(timeout)
-			th.kill
-			$scheduler_timeout = true
-			raise("scheduler timeout in:\n#{th.backtrace.join("\n")}")
-		end
-	end
-
-	def run_with_scheduler(timeout=10)
-		thread_with_timeout(timeout) do
-			setup
-			Fiber.schedule do
-				conn = PG.connect(@conninfo_gate)
-
-				yield conn
-
-				conn.finish
-				stop_scheduler
-			end
-		end
-	end
 
 	it "connects to a server" do
 		run_with_scheduler do |conn|
@@ -109,12 +62,25 @@ context "with a Fiber scheduler", :scheduler do
 		end
 	end
 
+	it "connects with environment variables", :postgresql_12, :unix_socket do
+		run_with_scheduler do
+			vars = PG::Connection.conninfo_parse(@conninfo_gate).each_with_object({}){|h, o| o[h[:keyword].to_sym] = h[:val] if h[:val] }
+
+			tmpconn = with_env_vars(PGHOST: "scheduler-localhost", PGPORT: vars[:port], PGDATABASE: vars[:dbname], PGSSLMODE: vars[:sslmode]) do
+				PG.connect
+			end
+			expect( tmpconn.status ).to eq( PG::CONNECTION_OK )
+			expect( tmpconn.host ).to eq( "scheduler-localhost" )
+			tmpconn.finish
+		end
+	end
+
 	it "can connect with DNS lookup", :scheduler_address_resolve do
 		run_with_scheduler do
 			conninfo = @conninfo_gate.gsub(/(^| )host=\w+/, " host=scheduler-localhost")
 			conn = PG.connect(conninfo)
 			opt = conn.conninfo.find { |info| info[:keyword] == 'host' }
-			expect( opt[:val] ).to eq( 'scheduler-localhost' )
+			expect( opt[:val] ).to start_with( 'scheduler-localhost' )
 			conn.finish
 		end
 	end
@@ -155,6 +121,18 @@ context "with a Fiber scheduler", :scheduler do
 				SELECT 3, pg_sleep(0.1);
 			EOT
 			expect( res.values ).to eq( [["3", ""]] )
+		end
+	end
+
+	it "can use stream_each_* methods" do
+		run_with_scheduler do |conn|
+			conn.send_query( "SELECT generate_series(0,999);" )
+			conn.set_single_row_mode
+
+			res = conn.get_result
+			rows = res.stream_each_row.to_a
+
+			expect( rows ).to eq( (0..999).map{ [_1.to_s] } )
 		end
 	end
 
@@ -258,14 +236,17 @@ context "with a Fiber scheduler", :scheduler do
 
 	it "can cancel a query" do
 		run_with_scheduler do |conn|
-			conn.send_query "SELECT pg_sleep(5)"
-			conn.block(0.01) # trigger transmission to the server
-			conn.cancel
+			start = Time.now
+			conn.set_notice_processor do |notice|
+				conn.cancel if notice =~ /foobar/
+			end
+			conn.send_query "do $$ BEGIN RAISE NOTICE 'foobar'; PERFORM pg_sleep(5); END; $$ LANGUAGE plpgsql;"
 			expect{ conn.get_last_result }.to raise_error(PG::QueryCanceled)
+			expect( Time.now - start ).to be < 4.9
 		end
 	end
 
-	it "can encrypt_password", :postgresql_10 do
+	it "can encrypt_password" do
 		run_with_scheduler do |conn|
 			res = conn.encrypt_password "passw", "myuser"
 			expect( res ).to  match( /\S+/ )
@@ -282,12 +263,20 @@ context "with a Fiber scheduler", :scheduler do
 			expect( ping ).to eq( PG::PQPING_OK )
 		end
 	end
-end
 
-# Do not wait for threads doing blocking calls at the process shutdown.
-# Instead exit immediately after printing the rspec report, if we know there are pending IO calls, which do not react on ruby interrupts.
-END{
-	if $scheduler_timeout
-		exit!(1)
+	it "can send a pipeline_sync message", :postgresql_14 do
+		run_with_scheduler(99) do |conn|
+			conn.enter_pipeline_mode
+			1000.times do |idx|
+				# This doesn't fail on sync_pipeline_sync, since PQpipelineSync() tries to flush, but doesn't wait for writablility.
+				conn.pipeline_sync
+			end
+			1000.times do
+				expect( conn.get_result.result_status ).to eq( PG::PGRES_PIPELINE_SYNC )
+			end
+			expect( conn.get_result ).to be_nil
+			expect( conn.get_result ).to be_nil
+			conn.exit_pipeline_mode
+		end
 	end
-}
+end

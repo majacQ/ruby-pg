@@ -57,6 +57,7 @@
 #endif
 
 /* PostgreSQL headers */
+#include "pg_config.h"
 #include "libpq-fe.h"
 #include "libpq/libpq-fs.h"              /* large-object interface */
 #include "pg_config_manual.h"
@@ -75,19 +76,14 @@ typedef long suseconds_t;
 	#define PG_MAX_COLUMNS 4000
 #endif
 
-#ifndef RARRAY_AREF
-#define RARRAY_AREF(a, i) (RARRAY_PTR(a)[i])
-#endif
-
-#ifdef HAVE_RB_GC_MARK_MOVABLE
-#define pg_compact_callback(x) (x)
 #define pg_gc_location(x) x = rb_gc_location(x)
-#else
-#define rb_gc_mark_movable(x) rb_gc_mark(x)
-#define pg_compact_callback(x) {(x)}
-#define pg_gc_location(x) UNUSED(x)
-#endif
 
+/* For compatibility with ruby < 3.0 */
+#ifndef RUBY_TYPED_FROZEN_SHAREABLE
+#define PG_RUBY_TYPED_FROZEN_SHAREABLE 0
+#else
+#define PG_RUBY_TYPED_FROZEN_SHAREABLE RUBY_TYPED_FROZEN_SHAREABLE
+#endif
 #define PG_ENC_IDX_BITS 28
 
 /* The data behind each PG::Connection object */
@@ -96,6 +92,9 @@ typedef struct {
 
 	/* Cached IO object for the socket descriptor */
 	VALUE socket_io;
+	/* function pointers of the original libpq notice receivers */
+	PQnoticeReceiver default_notice_receiver;
+	PQnoticeProcessor default_notice_processor;
 	/* Proc object that receives notices as PG::Result objects */
 	VALUE notice_receiver;
 	/* Proc object that receives notices as String objects */
@@ -117,10 +116,8 @@ typedef struct {
 	/* enable automatic flushing of send data at the end of send_query calls */
 	unsigned int flush_data : 1;
 
-#if defined(_WIN32)
 	/* File descriptor to be used for rb_w32_unwrap_io_handle() */
 	int ruby_sd;
-#endif
 } t_pg_connection;
 
 typedef struct pg_coder t_pg_coder;
@@ -209,6 +206,7 @@ typedef struct {
 	t_pg_coder comp;
 	t_pg_coder *elem;
 	int needs_quotation;
+	int dimensions;
 	char delimiter;
 } t_pg_composite_coder;
 
@@ -306,6 +304,7 @@ void init_pg_text_decoder                              _(( void ));
 void init_pg_binary_encoder                            _(( void ));
 void init_pg_binary_decoder                            _(( void ));
 void init_pg_tuple                                     _(( void ));
+void init_pg_cancon                                    _(( void ));
 VALUE lookup_error_class                               _(( const char * ));
 VALUE pg_bin_dec_bytea                                 _(( t_pg_coder*, const char *, int, int, int, int ));
 VALUE pg_text_dec_string                               _(( t_pg_coder*, const char *, int, int, int, int ));
@@ -313,7 +312,7 @@ int pg_coder_enc_to_s                                  _(( t_pg_coder*, VALUE, c
 int pg_text_enc_identifier                             _(( t_pg_coder*, VALUE, char *, VALUE *, int));
 t_pg_coder_enc_func pg_coder_enc_func                  _(( t_pg_coder* ));
 t_pg_coder_dec_func pg_coder_dec_func                  _(( t_pg_coder*, int ));
-void pg_define_coder                                   _(( const char *, void *, VALUE, VALUE ));
+VALUE pg_define_coder                                  _(( const char *, void *, VALUE, VALUE ));
 VALUE pg_obj_to_i                                      _(( VALUE ));
 VALUE pg_tmbc_allocate                                 _(( void ));
 void pg_coder_init_encoder                             _(( VALUE ));
@@ -344,6 +343,14 @@ void pg_typemap_compact                                _(( void * ));
 
 PGconn *pg_get_pgconn                                  _(( VALUE ));
 t_pg_connection *pg_get_connection                     _(( VALUE ));
+VALUE pgconn_block                                     _(( int, VALUE *, VALUE ));
+#ifdef __GNUC__
+__attribute__((format(printf, 3, 4)))
+#endif
+NORETURN(void pg_raise_conn_error                      _(( VALUE klass, VALUE self, const char *format, ...)));
+VALUE pg_wrap_socket_io                                _(( int sd, VALUE self, VALUE *p_socket_io, int *p_ruby_sd ));
+void pg_unwrap_socket_io                               _(( VALUE self, VALUE *p_socket_io, int ruby_sd ));
+
 
 VALUE pg_new_result                                    _(( PGresult *, VALUE ));
 VALUE pg_new_result_autoclear                          _(( PGresult *, VALUE ));
@@ -362,7 +369,6 @@ pgresult_get_this( VALUE self )
 }
 
 
-rb_encoding * pg_get_pg_encoding_as_rb_encoding        _(( int ));
 rb_encoding * pg_get_pg_encname_as_rb_encoding         _(( const char * ));
 const char * pg_get_rb_encoding_as_pg_encoding         _(( rb_encoding * ));
 rb_encoding *pg_conn_enc_get                           _(( PGconn * ));

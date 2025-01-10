@@ -47,14 +47,18 @@ class PG::BasicTypeMapForQueries < PG::TypeMapByClass
 	# Options:
 	# * +registry+: Custom type registry, nil for default global registry
 	# * +if_undefined+: Optional +Proc+ object which is called, if no type for an parameter class is not defined in the registry.
+	#   The +Proc+ object is called with the name and format of the missing type.
+	#   Its return value is not used.
 	def initialize(connection_or_coder_maps, registry: nil, if_undefined: nil)
 		@coder_maps = build_coder_maps(connection_or_coder_maps, registry: registry)
 		@array_encoders_by_klass = array_encoders_by_klass
 		@encode_array_as = :array
-		@if_undefined = if_undefined || proc { |oid_name, format|
-			raise UndefinedEncoder, "no encoder defined for type #{oid_name.inspect} format #{format}"
-		}
+		@if_undefined = if_undefined || method(:raise_undefined_type).to_proc
 		init_encoders
+	end
+
+	private def raise_undefined_type(oid_name, format)
+		raise UndefinedEncoder, "no encoder defined for type #{oid_name.inspect} format #{format}"
 	end
 
 	# Change the mechanism that is used to encode ruby array values
@@ -162,14 +166,19 @@ class PG::BasicTypeMapForQueries < PG::TypeMapByClass
 				@textarray_encoder
 	end
 
-	DEFAULT_TYPE_MAP = {
+	begin
+		PG.require_bigdecimal_without_warning
+		has_bigdecimal = true
+	rescue LoadError
+	end
+
+	DEFAULT_TYPE_MAP = PG.make_shareable({
 		TrueClass => [1, 'bool', 'bool'],
 		FalseClass => [1, 'bool', 'bool'],
 		# We use text format and no type OID for numbers, because setting the OID can lead
 		# to unnecessary type conversions on server side.
 		Integer => [0, 'int8'],
 		Float => [0, 'float8'],
-		BigDecimal => [0, 'numeric'],
 		Time => [0, 'timestamptz'],
 		# We use text format and no type OID for IPAddr, because setting the OID can lead
 		# to unnecessary inet/cidr conversions on the server side.
@@ -177,17 +186,17 @@ class PG::BasicTypeMapForQueries < PG::TypeMapByClass
 		Hash => [0, 'json'],
 		Array => :get_array_type,
 		BinaryData => [1, 'bytea'],
-	}
+	}.merge(has_bigdecimal ? {BigDecimal => [0, 'numeric']} : {}))
+	private_constant :DEFAULT_TYPE_MAP
 
-	DEFAULT_ARRAY_TYPE_MAP = {
+	DEFAULT_ARRAY_TYPE_MAP = PG.make_shareable({
 		TrueClass => [0, '_bool'],
 		FalseClass => [0, '_bool'],
 		Integer => [0, '_int8'],
 		String => [0, '_text'],
 		Float => [0, '_float8'],
-		BigDecimal => [0, '_numeric'],
 		Time => [0, '_timestamptz'],
 		IPAddr => [0, '_inet'],
-	}
-
+	}.merge(has_bigdecimal ? {BigDecimal => [0, '_numeric']} : {}))
+	private_constant :DEFAULT_ARRAY_TYPE_MAP
 end

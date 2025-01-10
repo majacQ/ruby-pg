@@ -190,11 +190,11 @@ static const rb_data_type_t pg_tmbo_type = {
 		pg_tmbo_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_tmbo_memsize,
-		pg_compact_callback(pg_tmbo_compact),
+		pg_tmbo_compact,
 	},
 	&pg_typemap_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 static VALUE
@@ -212,11 +212,11 @@ pg_tmbo_s_allocate( VALUE klass )
 	this->typemap.funcs.typecast_result_value = pg_tmbo_result_value;
 	this->typemap.funcs.typecast_query_param = pg_typemap_typecast_query_param;
 	this->typemap.funcs.typecast_copy_get = pg_typemap_typecast_copy_get;
-	this->typemap.default_typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap.default_typemap, pg_typemap_all_strings);
 	this->max_rows_for_online_lookup = 10;
 
 	for( i=0; i<2; i++){
-		this->format[i].oid_to_coder = rb_hash_new();
+		RB_OBJ_WRITE(self, &this->format[i].oid_to_coder, rb_hash_new());
 	}
 
 	return self;
@@ -242,6 +242,7 @@ pg_tmbo_add_coder( VALUE self, VALUE coder )
 	t_pg_coder *p_coder;
 	struct pg_tmbo_oid_cache_entry *p_ce;
 
+	rb_check_frozen(self);
 	TypedData_Get_Struct(coder, t_pg_coder, &pg_coder_type, p_coder);
 
 	if( p_coder->format < 0 || p_coder->format > 1 )
@@ -276,6 +277,7 @@ pg_tmbo_rm_coder( VALUE self, VALUE format, VALUE oid )
 	int i_format = NUM2INT(format);
 	struct pg_tmbo_oid_cache_entry *p_ce;
 
+	rb_check_frozen(self);
 	if( i_format < 0 || i_format > 1 )
 		rb_raise(rb_eArgError, "invalid format code %d", i_format);
 
@@ -318,6 +320,7 @@ static VALUE
 pg_tmbo_max_rows_for_online_lookup_set( VALUE self, VALUE value )
 {
 	t_tmbo *this = RTYPEDDATA_DATA( self );
+	rb_check_frozen(self);
 	this->max_rows_for_online_lookup = NUM2INT(value);
 	return value;
 }
@@ -338,7 +341,7 @@ pg_tmbo_max_rows_for_online_lookup_get( VALUE self )
  *    typemap.build_column_map( result )
  *
  * This builds a PG::TypeMapByColumn that fits to the given PG::Result object
- * based on it's type OIDs.
+ * based on it's type OIDs and binary/text format.
  *
  */
 static VALUE
@@ -356,7 +359,7 @@ pg_tmbo_build_column_map( VALUE self, VALUE result )
 
 
 void
-init_pg_type_map_by_oid()
+init_pg_type_map_by_oid(void)
 {
 	s_id_decode = rb_intern("decode");
 

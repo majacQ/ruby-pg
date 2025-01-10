@@ -40,11 +40,11 @@ static const rb_data_type_t pg_tmir_type = {
 		pg_typemap_mark,
 		RUBY_TYPED_DEFAULT_FREE,
 		pg_tmir_memsize,
-		pg_compact_callback(pg_tmir_compact),
+		pg_tmir_compact,
 	},
 	&pg_typemap_type,
 	0,
-	RUBY_TYPED_FREE_IMMEDIATELY,
+	RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED | PG_RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 /*
@@ -210,6 +210,9 @@ pg_tmir_typecast_query_param( VALUE self, VALUE param_value, VALUE field )
  * This method is called, when a type map is used for decoding copy data,
  * before the value is casted.
  *
+ * Should return the expected number of columns or 0 if the number of columns is unknown.
+ * This number is only used for memory pre-allocation.
+ *
  */
 static VALUE pg_tmir_fit_to_copy_get_dummy( VALUE self ){}
 #endif
@@ -291,7 +294,7 @@ pg_tmir_s_allocate( VALUE klass )
 	this->typemap.funcs.typecast_result_value = pg_tmir_result_value;
 	this->typemap.funcs.typecast_query_param = pg_tmir_query_param;
 	this->typemap.funcs.typecast_copy_get = pg_tmir_copy_get;
-	this->typemap.default_typemap = pg_typemap_all_strings;
+	RB_OBJ_WRITE(self, &this->typemap.default_typemap, pg_typemap_all_strings);
 	this->self = self;
 
 	return self;
@@ -299,7 +302,7 @@ pg_tmir_s_allocate( VALUE klass )
 
 
 void
-init_pg_type_map_in_ruby()
+init_pg_type_map_in_ruby(void)
 {
 	s_id_fit_to_result = rb_intern("fit_to_result");
 	s_id_fit_to_query = rb_intern("fit_to_query");

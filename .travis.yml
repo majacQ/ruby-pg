@@ -17,10 +17,10 @@ matrix:
       script: |
         docker run --rm -t --network=host ruby-pg
 
-    - rvm: "2.5"
+    - rvm: "2.7"
       env:
-        - "PGVERSION=9.3"
-      # Use Ubuntu-16.04 since postgresql-9.3 depends on openssl-1.0.0, which isn't available in 20.04
+        - "PGVERSION=10"
+      # Use Ubuntu-16.04 which provides openssl-1.0.0, which isn't available in 20.04
       dist: xenial
     - rvm: ruby-head
       env:
@@ -38,8 +38,8 @@ before_install:
   # Download and install postgresql version to test against in /opt (for non-cross compile only)
   - echo "deb http://apt.postgresql.org/pub/repos/apt/ ${TRAVIS_DIST}-pgdg main $PGVERSION" | sudo tee -a /etc/apt/sources.list.d/pgdg.list
   - wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-  - sudo apt -y update
-  - sudo apt -y --allow-downgrades install postgresql-$PGVERSION libpq5=$PGVERSION* libpq-dev=$PGVERSION*
+  - sudo apt-get -y update
+  - sudo apt-get -y --allow-downgrades install postgresql-$PGVERSION libpq5=$PGVERSION* libpq-dev=$PGVERSION*
   - export PATH=/usr/lib/postgresql/$PGVERSION/bin:$PATH
 
 script:
